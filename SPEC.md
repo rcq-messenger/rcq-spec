@@ -29,19 +29,19 @@ In scope:
 
 Out of scope:
 
-- Business and gameplay APIs (inventory, marketplace, audio rooms,
-  Crash / Hi-Lo / Limbo, pet hunting, stories, Hood, daily QA,
-  polls, news, reputation, jeton reactions, referrals, premium,
+- Non-messaging APIs (audio rooms, random chat, stories, nearby,
+  hood banners, UIN shop, reports, news, polls, referrals,
   admin). These ride on the same authentication layer described
   here, but their endpoints are not part of the messaging
-  protocol. See Section 14 for a one-line index.
+  protocol. See Section 14 for a one-line index, and Section 14.1
+  for the 2026-05-27 pivot record of what was removed.
 - Operational concerns (deployment, monitoring, backups).
 - The libsignal protocol itself. RCQ uses the upstream
   `libsignal` implementation (v0.93+, PQXDH) verbatim for v=2
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1**. Last updated: **2026-05-26**. Spec maintainer:
+Version: **v1.1**. Last updated: **2026-05-27**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 
 ## 1. Overview
@@ -1927,35 +1927,71 @@ here.
   Ratchet. Clients SHOULD prefer v=2 whenever the peer
   publishes a libsignal bundle.
 
-## 14. Out of Scope (Business APIs)
+## 14. Out of Scope (Non-Messaging APIs)
 
 These routers ride on the auth + identity layer described
 above but their endpoints are not part of the messaging
 protocol:
 
-- `/marketplace`, `/uin_auctions` — marketplace and premium-UIN
-  auctions
-- `/items`, `/trades` — inventory and item economy
 - `/audio_rooms` — multi-party voice rooms (mesh WebRTC,
   signalling through the WS channel)
-- `/pets_hunt` — pet-hunting minigame
-- `/crash`, `/hilo`, `/limbo` — provably-fair minigames
-- `/reports`, bounty-credits surface — moderation and bug
-  bounty
-- `/stories` — story feed
-- `/hood`, `/hood_banners`, `/nearby` — geo-anchored chat /
-  banner / nearby-users surfaces
 - `/random` — anonymous random-chat pairing
-- `/daily_qa`, `/news`, `/polls` — daily-QA streak, news, polls
-  (both global and per-group)
-- `/jeton_reactions`, `/referrals`, `/reputation` —
-  engagement / social-loop features
-- `/premium` — paid-unlock media flow
+- `/stories` — story feed
+- `/nearby` — opt-in geohash check-in for the "people nearby"
+  surface
+- `/hood/banners` — paid district-banner placements (IAP
+  receipt validation; see Section 14.1)
+- `/uin/quote` + `/uin/purchase` — UIN shop (any free 3-9 digit
+  UIN, IAP-priced by length; the purchase endpoint reuses the
+  account-migration helper from Section 10)
+- `/reports` — moderation queue, including the bug-bounty
+  context tag (`context = "bug_bounty"`); no monetary reward
+  is associated with the submission
+- `/news`, `/polls`, `/polls/group` — admin-posted feed,
+  global polls, per-group polls
+- `/referrals` — invite-tracking only; no reward attached
 - `/admin` — admin panel (HTTP Basic, separate auth from the
   user JWT)
 
 Each uses the JWT bearer from Section 2 and the WS channel
 from Section 7 but has its own dedicated payload contracts.
+
+### 14.1 Pivot 2026-05-27
+
+The 2026-05-27 pivot removed the gamification + economy
+layer that had been bolted on during closed beta. The
+following routers no longer exist on the production
+backend and the matching iOS surfaces are gone from the
+client: `/marketplace`, `/uin_auctions`, `/items`,
+`/trades`, `/crash`, `/hilo`, `/limbo`, `/pets_hunt`,
+`/reputation`, `/jeton_reactions`, `/daily_qa`, `/premium`,
+`/hood` (the geohash-bucket chat). The standalone
+hood-banner subsystem was retained as the IAP-priced
+`/hood/banners` endpoint described above; everything else
+in that list is permanently cut.
+
+Paid traffic above the free tier on `/media/upload` was
+also removed in the same pass — uploads are now flat-free
+up to the per-file safety cap.
+
+Two paid surfaces remain, both currently behind a mock
+IAP-receipt shim that accepts any non-empty string as a
+placeholder while StoreKit wiring lands:
+
+- **UIN shop** — `POST /uin/quote` returns price + availability
+  for a target UIN; `POST /uin/purchase` validates the
+  receipt, confirms the UIN is still free, and atomically
+  migrates the caller's account onto the new UIN using the
+  helper defined in Section 10.
+- **Hood banners** — `POST /hood/banners` inserts a banner
+  into a geohash-level-6 bucket with a TTL (`1h` / `6h` /
+  `24h` / `7d`). Pricing tiers exposed via
+  `GET /hood/banners/pricing`. Bucket capacity capped at
+  24 active banners; per-UIN create rate limited.
+
+Real StoreKit verification will replace the mock-receipt
+gate; the JSON payload field is named `receipt` for
+forward compatibility.
 
 ## 15. Spec Maintenance
 
@@ -1987,3 +2023,4 @@ recorded in the change log below.
 | Version | Date       | Notes                                       |
 |---------|------------|---------------------------------------------|
 | v1      | 2026-05-26 | Initial public spec, covering the messaging core as deployed in TestFlight build 54. |
+| v1.1    | 2026-05-27 | Pivot pass. Section 14 trimmed: cut routers documented as removed; UIN shop + IAP-priced hood banners documented as the only paid surfaces (mock receipt). No wire-breaking changes to the messaging core. |
