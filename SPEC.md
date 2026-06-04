@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1)
+# RCQ Protocol Specification (v1.2)
 
 ## 0. Status & Scope
 
@@ -78,9 +78,12 @@ The system has three pieces:
 Key design choices:
 
 - **Anonymous identity**: a UIN is a numeric handle the server
-  allocates randomly. No phone number, no email, no captcha. The
-  cost is that account recovery is not possible — the client owns
-  the only copy of the private keys.
+  allocates randomly. No phone number, no email, no captcha. By
+  default the client owns the only copy of the private keys, so an
+  account is "nothing to seize". New accounts may **opt in** to a
+  seed-phrase backup (Section 2.7): the keypairs derive from a
+  32-byte seed the user can write down as a BIP39 phrase, trading a
+  slice of that property for recoverability on a new device.
 - **libsignal for content secrecy**: every message body rides
   through Signal's Double Ratchet. PQXDH (X3DH + Kyber) is used
   to bootstrap each session so an attacker with a future quantum
@@ -239,7 +242,75 @@ After bootstrap, the client holds:
 The server stores only the **public** halves above, plus the
 nickname and optional profile data. The server has no copy of
 any private key. There is no key escrow, no recovery question,
-and no "forgot password" flow.
+and no server-side "forgot password" flow. The only recovery
+path is the user-held seed phrase (Section 2.7), which never
+leaves the device unless the user writes it down.
+
+### 2.7 Account recovery (seed phrase)
+
+Recovery is **opt-in** and **off by default**. A recoverable
+account means one durable secret grants full access forever,
+which weakens the ephemeral / "nothing to seize" posture; users
+who want durability opt in by recording the phrase.
+
+**Seed → keys.** A new account derives both base keypairs from a
+single random 32-byte master seed via HKDF-SHA256 (empty/zero
+salt; outputs clamped per curve):
+
+- X25519 identity priv = `HKDF(seed, info="rcq-recovery-x25519-v1")[0:32]`
+- Ed25519 signing priv = `HKDF(seed, info="rcq-recovery-ed25519-v1")[0:32]`
+
+The seed is encoded as a 24-word **BIP39** phrase (standard
+2048-word English wordlist), shown once for the user to write
+down. The seed lives only in the device secure store, so
+uninstalling without recording the phrase still loses the
+account (ephemerality preserved). The info strings are fixed for
+cross-platform parity (iOS CryptoKit ⇄ Android BouncyCastle ⇄
+the web @noble stack all derive identical keys from a phrase).
+
+**Legacy accounts** (created before seed derivation) have no
+derivable seed; they instead export their raw
+`identity_priv || signing_priv` (64 bytes) as a **48-word** BIP39
+phrase. Restore accepts either 24- or 48-word input.
+
+**Restore = prove ownership of the signing key.** A stateless
+two-step challenge/response that reveals nothing about whether an
+account exists:
+
+`POST /auth/recover/challenge`
+```json
+{ "signing_key": "<base64 Ed25519 public key>" }
+```
+→ `{ "challenge": "<opaque short-lived (~120s) token>" }`
+
+`POST /auth/recover`
+```json
+{
+  "signing_key": "<base64 Ed25519 public key>",
+  "challenge":   "<from the challenge step>",
+  "signature":   "<base64 Ed25519 signature over the challenge string>"
+}
+```
+→ `{ "uin": <int>, "token": "<JWT>" }` — same shape as
+`/auth/register` (Section 2.2).
+
+The server verifies the challenge token, verifies the Ed25519
+signature over the challenge bytes against the supplied public
+key, then returns the UIN bound to that signing key with a fresh
+session token. Errors: `400 invalid_challenge` / `missing_key`,
+`401 bad_signature`, `404 identity_not_found`. (The `signing_key`
+column is indexed for this lookup.)
+
+**Scope of recovery.** Restores the UIN, identity, and
+server-side data (contacts, groups, pending requests). Local
+message **history is not** restored — it is device-only E2E state
+— unless an encrypted history backup is added later. On a
+restored device the client re-publishes a fresh prekey bundle and
+peers see a key change (surfaced via safety numbers); v=1 keeps
+working, v=2 sessions re-bootstrap. Running the same identity on
+two live devices at once is a migration, not multi-device: the
+v=2 ratchet desyncs (see Section 13). For a per-device identity
+that coexists, see Section 5.6.
 
 ## 3. User Profile & Visibility
 
@@ -716,6 +787,50 @@ Response:
   reuse.
 - **One-time prekeys**: each is consumed exactly once. Top up
   via `/keys/prekeys` when count drops.
+
+### 5.6 Multi-device (secondary devices)
+
+Everything above is per-UIN with an implicit **primary** device
+(libsignal `deviceId = 1`, bundle on the user row). A UIN may also
+register **secondary** devices (e.g. the web client) so each runs
+its own libsignal session. The whole mechanism is additive and
+back-compatible: pre-multi-device clients ignore it and keep using
+device 1.
+
+- **Per-device OPK pools.** `one_time_prekeys.device_id` is `NULL`
+  for the primary pool (phone) and the device's id (`2..127`) for a
+  secondary. The primary fetch/replenish/upload paths scope to
+  `device_id IS NULL`, so a phone re-bootstrap never drains a
+  secondary's pool and vice versa.
+
+`POST /keys/devices` — register a secondary device. The server
+assigns a `device_id` (2..127). The body carries the device's own
+libsignal bundle (identity / signed prekey / Kyber prekey / OPK
+batch) plus a **`sealed_sender_pub`**: the X25519 OUTER-ECIES key a
+sender encrypts the sealed-sender envelope to for *this* device.
+(The primary device's outer key is the UIN `identity_key` from
+`/users/{uin}/info`; a secondary holds only its own keys and never
+the account master key.) → `{ "device_id": <int> }`.
+
+`GET /keys/{uin}/devices` — list a UIN's devices (the primary, when
+it has a published bundle, plus all secondaries). A sender uses this
+to fan out one ciphertext per device.
+
+`GET /keys/{uin}/devices/{device_id}/bundle` — the prekey bundle for
+one device. `device_id = 1` delegates to the legacy
+`GET /keys/{uin}/bundle`; `>= 2` consumes that device's own OPK
+pool. Bundles carry two additive fields: `device_id` and
+`sealed_sender_pub` (old clients ignore both).
+
+A v=2 message is encrypted to exactly ONE libsignal session, so
+reaching a UIN on all its devices requires the **sender** to fan
+out (one ciphertext per device). Delivery is unchanged: the WS
+already fans out to every socket of a UIN (Section 7.2) and the
+offline queue is per-UIN, so each device decrypts its own ciphertext
+and ignores the rest — no per-device delivery addressing is needed.
+A staged rollout is inherent: a recipient is reachable on a new
+device only once senders are device-aware (old senders still reach
+device 1). This is the same dependency Signal's multi-device has.
 
 ## 6. Messaging Protocol
 
@@ -2013,10 +2128,11 @@ implementation already does) may go straight to PR.
 
 ### 15.2 Versioning
 
-This document is **v1**. Version bumps are tied to wire-
-breaking changes only. Additive endpoints, new optional fields,
-and new envelope types do not require a version bump; they are
-recorded in the change log below.
+This document is **v1.2**. The protocol wire major is still v1;
+the `.x` suffix tracks doc revisions. Wire-breaking changes would
+bump the major. Additive endpoints, new optional fields, and new
+envelope types do not require a major bump; they are recorded in
+the change log below.
 
 ### 15.3 Version history
 
@@ -2024,3 +2140,4 @@ recorded in the change log below.
 |---------|------------|---------------------------------------------|
 | v1      | 2026-05-26 | Initial public spec, covering the messaging core as deployed in TestFlight build 54. |
 | v1.1    | 2026-05-27 | Pivot pass. Section 14 trimmed: cut routers documented as removed; UIN shop + IAP-priced hood banners documented as the only paid surfaces (mock receipt). No wire-breaking changes to the messaging core. |
+| v1.2    | 2026-06-04 | Documented two shipped additive features. New §2.7 Account recovery (opt-in BIP39 seed phrase, `POST /auth/recover/challenge` + `POST /auth/recover` Ed25519 challenge/response; 48-word legacy raw-key export) — corrects the earlier "recovery is not possible" framing. New §5.6 Multi-device (secondary devices: `POST /keys/devices`, `GET /keys/{uin}/devices`, `GET /keys/{uin}/devices/{device_id}/bundle`, per-device OPK pools, `device_id` + `sealed_sender_pub` bundle fields, sender fan-out). No wire-breaking changes. |
