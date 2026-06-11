@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.2)
+# RCQ Protocol Specification (v1.3)
 
 ## 0. Status & Scope
 
@@ -106,12 +106,11 @@ Key design choices:
 A UIN is a positive integer in the range `[100_000,
 999_999_999]` (inclusive). Default allocation picks a random
 value in that range, rejecting any that collide with an existing
-account or with a UIN held in the auction inventory pool
-(`OwnedUin`).
+account or with a UIN reserved by the UIN shop (`OwnedUin`).
 
-Four-digit "vanity" UINs are not part of the default allocator;
-they are minted through the premium UIN auction surface (see
-Section 14) and assigned via the migration endpoint (Section 10).
+Short "vanity" UINs are not part of the default allocator; they
+are obtained through the UIN shop (see Section 14) and assigned
+via the migration endpoint (Section 10).
 This document treats UINs as opaque integers — the wire format
 does not depend on digit count.
 
@@ -198,8 +197,8 @@ Behaviour:
 2. Deletes the `User` row. Cascading FKs drop all dependent
    rows (`device_tokens`, `contacts` rows the user owned,
    `one_time_prekeys`, etc.). Rows that hold a bare BigInteger
-   reference to the UIN without an FK (e.g. group membership,
-   marketplace history) are deliberately left dangling and
+   reference to the UIN without an FK (e.g. group membership)
+   are deliberately left dangling and
    garbage-collected by future writes.
 3. Returns `204 No Content`.
 
@@ -331,8 +330,6 @@ hidden, because senders need it to encrypt):
 | `signal_identity_key`     | string|null | base64 libsignal IdentityKey; null = v=1 only |
 | `signal_registration_id`  | int|null    | libsignal registrationId             |
 | `status`                  | string      | see Section 3.3                      |
-| `equipped_pet`            | object|null | small UI overlay; opt-in, public     |
-| `trade_policy`            | string      | published so other clients can hide UI; values: `everyone`/`contacts`/`nobody` |
 
 Gated by the target's `profile_visibility` setting (default
 `everyone`):
@@ -354,16 +351,13 @@ Gated separately:
 
 - `last_seen` (datetime|null): governed by `last_seen_visibility`
   (default `everyone`).
-- `reputation` (int|null): governed by `reputation_visibility`
-  (default `everyone`).
 
 Owner-only echoes (always null for third-party callers, so the
 owner can render the Settings page without an extra fetch):
 
 `last_seen_visibility`, `gender_visibility`, `profile_visibility`,
 `group_invite_policy`, `call_policy`, `read_receipts_visibility`,
-`reputation_visibility`, `presence_persistent`,
-`presence_ttl_minutes`.
+`presence_persistent`, `presence_ttl_minutes`.
 
 ### 3.2 Visibility scopes
 
@@ -439,9 +433,9 @@ Editable fields: `nickname`, `first_name`, `last_name`, `age`,
 strings; server stores comma-joined), `homepage`, `status_message`.
 
 Editable settings: `last_seen_visibility`, `gender_visibility`,
-`profile_visibility`, `group_invite_policy`, `trade_policy`,
-`call_policy`, `read_receipts_visibility`, `reputation_visibility`,
-`presence_persistent`, `presence_ttl_minutes`.
+`profile_visibility`, `group_invite_policy`, `call_policy`,
+`read_receipts_visibility`, `presence_persistent`,
+`presence_ttl_minutes`.
 
 Validation:
 
@@ -474,8 +468,6 @@ matching row if present (no error if absent).
 ```json
 {
   "contact_requests":      true,
-  "trades_from_contacts":  true,
-  "trades_from_strangers": false,
   "muted_uins":            [<int>, ...],
   "muted_group_ids":       [<int>, ...]
 }
@@ -487,11 +479,11 @@ the merged state.
 
 ### 3.6 Out of scope on the profile
 
-The model also carries `is_suspended`, `active_days`,
-`last_active_day`, `reputation`, and a few business-only fields
-(e.g. inventory-related). `is_suspended` is admin-set and
-gates the WebSocket close code (Section 7). The remainder
-belong to gamification (Section 14).
+The model also carries `is_suspended`, `active_days`, and
+`last_active_day`. `is_suspended` is admin-set and gates the
+WebSocket close code (Section 7). (A few vestigial columns from
+the pre-pivot economy layer remain in the table but are dead and
+unused — see Section 14.1.)
 
 ## 4. Contact Graph
 
@@ -525,7 +517,6 @@ Returns the caller's contact list as `ContactRow[]`:
     "signing_key":          "<base64>",
     "signal_identity_key":  "<base64|null>",
     "gender":               "<string|null>",
-    "equipped_pet":         {...}|null,
     "last_seen":            "<ISO datetime|null>"
   },
   ...
@@ -1095,15 +1086,13 @@ See Section 7-equivalent endpoints under `/groups/...`:
 - `GET /groups/{id}` — full info (members + settings).
 - `GET /groups/{id}/preview` — lightweight info for a non-member
   considering joining (carries name, description, member count,
-  entry price, owner nickname, avatar; does NOT carry membership
-  or history).
+  owner nickname, avatar; does NOT carry membership or history).
 - `GET /groups/search?q=...` — name substring search; excludes
   groups the caller is already in.
-- `POST /groups/{id}/join` — self-join (free or paid; paid
-  performs wallet debit with 5% house cut).
+- `POST /groups/{id}/join` — self-join (open groups only;
+  closed groups require an owner-issued invite).
 - `POST /groups/{id}/members` — invite (any member can invite,
-  unless the group is paid in which case only the owner can
-  free-invite).
+  subject to the group's invite policy).
 - `DELETE /groups/{id}/members/{member_uin}` — kick (admin+) or
   self-leave. Owner-leave promotes oldest member to owner; if
   the group is empty after, the group row is deleted.
@@ -1387,10 +1376,6 @@ sealed-sender envelopes with `envelope_type: "reaction"` or
 type; clients ingest them through the normal message path
 and apply local effects.
 
-There is a separate per-message **jeton reaction** feature
-(business / monetization) that does have its own router; that's
-out of scope.
-
 ### 7.5 `GET /users/me/turn-credentials`
 
 Mints short-lived TURN credentials for WebRTC calls. Implements
@@ -1448,7 +1433,6 @@ Notes:
   side. Convention:
   - `peer-<UIN>` → 1:1 chat with that UIN
   - `pending` → pending contact requests
-  - `trades` → trades list (business)
 
 ### 8.2 Silent / background drain
 
@@ -1480,7 +1464,7 @@ VoIP push violates Apple's contract and revokes the privilege.
 ### 8.4 Push preferences (server-side gating)
 
 For event kinds the server CAN identify the sender of —
-`contact_request`, `contact_response_accepted`, `trade_received`,
+`contact_request`, `contact_response_accepted`,
 etc. — the server consults
 `should_push_for(recipient, kind, sender_uin)` before firing
 the push:
@@ -1488,9 +1472,6 @@ the push:
 - A `muted_uins` entry for `sender_uin` blocks the push.
 - `kind == "contact_request"` is gated by
   `push_preferences.contact_requests` (default true).
-- `kind == "trade_received"` is split: if the sender is a
-  contact, `trades_from_contacts` (default true) gates;
-  otherwise `trades_from_strangers` (default false).
 
 Sealed-sender messages cannot pass through this filter (sender
 is unknown to the server) and always push when the recipient is
@@ -1523,35 +1504,25 @@ Media (photos, voice notes, video, files, group avatars) is
 shipped out-of-band as opaque encrypted blobs. The server sees
 only the ciphertext.
 
-### 9.1 Pricing tiers
+### 9.1 Size limits
 
-- Free tier: ≤ `FREE_TIER_BYTES = 50 MB`. No auth required,
-  no debit.
-- Paid tier: > 50 MB up to `MAX_BLOB_SIZE = 2 GB`. Auth
-  required. Costs 1 jeton per started 10 MB block above the
-  free tier. The price is computed against the **plaintext**
-  size (server backs out the AES-GCM 12-byte nonce + 16-byte
-  tag overhead before pricing).
+Uploads are flat-free up to a hard safety cap of
+`MAX_BLOB_SIZE = 2 GB` per blob (the per-blob bandwidth/disk
+backstop). There is no paid tier and no per-byte charge — the
+metered-jeton tier was removed in the 2026-05-27 pivot
+(Section 14.1).
 
 ### 9.2 `POST /media/upload`
 
 Multipart form:
 
 - `blob`: the raw ciphertext bytes (`File`).
-- `pay_jetons`: client-declared expected price (`Form(int)`).
 
-Bearer is optional in the free tier, required in the paid tier.
+Bearer is optional (uploads are open, IP-rate-limited).
 
 Behaviour:
 
 - `413` if blob size > `MAX_BLOB_SIZE`.
-- Compute `expected_cost = jeton_cost_for(size_bytes)`.
-- If `expected_cost > 0`:
-  - `401` if no bearer.
-  - `400` if `pay_jetons != expected_cost` (defensive against
-    a flag-flip race).
-  - `402` if wallet balance insufficient.
-  - Atomically debit wallet + upsert traffic counter.
 - Write the bytes to `MEDIA_ROOT/<uuid>.bin`. (Production
   migration to R2/S3 is a TODO; local filesystem today.)
 
@@ -1559,10 +1530,8 @@ Response (`201`):
 
 ```json
 {
-  "media_id":       "<32-char hex UUID>",
-  "size":           <int>,
-  "jetons_charged": <int>,
-  "wallet_tokens":  <int|null>     // new balance after debit; null for free
+  "media_id": "<32-char hex UUID>",
+  "size":     <int>
 }
 ```
 
@@ -1596,7 +1565,6 @@ The server therefore knows:
 
 - That a blob of N bytes was uploaded.
 - The blob's UUID.
-- (Sometimes, for paid uploads) which UIN paid for it.
 
 The server does NOT know:
 
@@ -1613,11 +1581,9 @@ Settings readout:
 
 ```json
 {
-  "year_month":      "YYYY-MM",
-  "bytes_used":      <int>,
-  "jetons_spent":    <int>,
-  "free_tier_bytes": <int>,
-  "max_blob_bytes":  <int>
+  "year_month":     "YYYY-MM",
+  "bytes_used":     <int>,
+  "max_blob_bytes": <int>
 }
 ```
 
@@ -1629,21 +1595,13 @@ shared among all group members. Since every member can already
 read every group plaintext (per-recipient encryption), exposing
 the key to the full member set is no further weakening.
 
-### 9.7 Premium media (paid unlock)
-
-Premium media (sender uploads with delayed key release; a
-recipient pays jetons to unlock the key) exists as a separate
-business feature on `/premium/...`. It rides on the same blob
-storage but adds a key-release escrow step. Details are out of
-scope for this spec.
-
 ## 10. Account Migration & Burn
 
 ### 10.1 `POST /account/migrate`
 
 Move every account-bound row from the caller's current UIN
-onto a freshly-allocated (or user-owned premium) UIN. Costs
-`MIGRATION_TOKEN_COST = 99` jetons.
+onto a freshly-allocated (or user-owned) UIN. Free — the
+pre-pivot jeton cost was removed.
 
 Request (optional body):
 
@@ -1654,8 +1612,8 @@ Request (optional body):
 - If `target_uin` is null/omitted: server allocates a fresh
   random UIN.
 - If `target_uin` is set: the caller must own an `OwnedUin`
-  row pointing at that UIN (won via the premium UIN auction
-  surface). Returns `403 {"code": "uin_not_owned"}` otherwise.
+  row pointing at that UIN (reserved via the UIN shop, Section
+  14). Returns `403 {"code": "uin_not_owned"}` otherwise.
 
 Cooldown: `RCQ_MIGRATION_COOLDOWN_SECONDS` (default 0 in dev;
 ~604800 / 7 days in production). State is held as a Redis key
@@ -1667,24 +1625,16 @@ across workers. Returns `429 {"code": "cooldown",
 
 | Surface                       | Re-keyed | Notes                                  |
 |-------------------------------|----------|----------------------------------------|
-| `User` row                    | created  | New row with old `nickname`, profile fields, `identity_key`, `signing_key`, status visibilities, reputation, push_preferences |
-| Wallet (tokens, scrolls)      | yes      | New balance = old − 99 jetons          |
-| Inventory items + history     | yes      | `ItemInstance.owner_uin`, `ItemHistoryEvent.from/to_uin` |
-| Trades                        | yes      | Both `from_uin` and `to_uin`           |
-| Marketplace listings          | yes      | Both `seller_uin` and `sold_to_uin`    |
+| `User` row                    | created  | New row with old `nickname`, profile fields, `identity_key`, `signing_key`, status visibilities, push_preferences |
 | Contacts (both directions)    | yes      | `Contact.owner_uin` and `Contact.contact_uin` |
 | Contact requests              | yes      |                                        |
 | Offline message queue         | yes      | `OfflineMessage.to_uin`                |
 | Group ownership & membership  | yes      | Both `Group.owner_uin` and `GroupMember.uin` |
 | Audio room ownership / mute   | yes      |                                        |
-| Bounty credits                | yes      | Pre-launch reward accumulation         |
-| Daily QA progress             | yes      |                                        |
 | Poll creators + voters        | yes      |                                        |
 | Hood banners                  | yes      |                                        |
 | Stories                       | yes      |                                        |
-| Pet Hunt state                | yes      |                                        |
-| Reputation grants (both sides)| yes      |                                        |
-| Auction history / OwnedUins   | yes      | Old UIN itself preserved as `OwnedUin(source="migrated")` under the new account |
+| OwnedUins                     | yes      | Old UIN itself preserved as `OwnedUin(source="migrated")` under the new account |
 
 #### 10.1.2 What does NOT carry over
 
@@ -1848,9 +1798,8 @@ Common status codes used by the messaging layer:
 
 | Status | Meaning                                              |
 |--------|------------------------------------------------------|
-| 400    | Malformed body / invalid enum / mismatched price     |
+| 400    | Malformed body / invalid enum                        |
 | 401    | Missing or invalid JWT                               |
-| 402    | Insufficient wallet balance (paid endpoints)         |
 | 403    | Authenticated but not permitted (admin-only / blocked / suspended / closed group) |
 | 404    | Target row not found                                 |
 | 409    | Conflict (already a contact, group cap reached, UIN already registered) |
@@ -1865,14 +1814,10 @@ suggested back-off in seconds and a body of the form
 
 Some endpoints return structured error bodies for client UI:
 
-- `402` insufficient funds:
-  `{"detail": {"code": "insufficient_tokens", "required": <int>, "have": <int>}}`
 - `403` closed group:
   `{"detail": {"code": "group_closed"}}`
 - `403` blocked by owner:
   `{"detail": {"code": "blocked"}}`
-- `403` paid-group invite gate:
-  `{"detail": {"code": "paid_group_owner_only_invite"}}`
 - `403` migration target not owned:
   `{"detail": {"code": "uin_not_owned", "uin": <int>}}`
 - `409` UIN already registered:
@@ -2128,7 +2073,7 @@ implementation already does) may go straight to PR.
 
 ### 15.2 Versioning
 
-This document is **v1.2**. The protocol wire major is still v1;
+This document is **v1.3**. The protocol wire major is still v1;
 the `.x` suffix tracks doc revisions. Wire-breaking changes would
 bump the major. Additive endpoints, new optional fields, and new
 envelope types do not require a major bump; they are recorded in
@@ -2141,3 +2086,4 @@ the change log below.
 | v1      | 2026-05-26 | Initial public spec, covering the messaging core as deployed in TestFlight build 54. |
 | v1.1    | 2026-05-27 | Pivot pass. Section 14 trimmed: cut routers documented as removed; UIN shop + IAP-priced hood banners documented as the only paid surfaces (mock receipt). No wire-breaking changes to the messaging core. |
 | v1.2    | 2026-06-04 | Documented two shipped additive features. New §2.7 Account recovery (opt-in BIP39 seed phrase, `POST /auth/recover/challenge` + `POST /auth/recover` Ed25519 challenge/response; 48-word legacy raw-key export) — corrects the earlier "recovery is not possible" framing. New §5.6 Multi-device (secondary devices: `POST /keys/devices`, `GET /keys/{uin}/devices`, `GET /keys/{uin}/devices/{device_id}/bundle`, per-device OPK pools, `device_id` + `sealed_sender_pub` bundle fields, sender fan-out). No wire-breaking changes. |
+| v1.3    | 2026-06-11 | Economy scrub: removed all remaining inline references to the gamification/economy layer that the 2026-05-27 pivot cut but earlier passes had left dangling in the live sections — jeton media pricing (uploads are now flat-free to the 2 GB safety cap, §9.1/§9.2/§9.5), premium media unlock (§9.7 deleted), paid groups (§6.4 join/invite + the related 402/`paid_group_*` error codes), the `equipped_pet`/`trade_policy`/`reputation`/`reputation_visibility` profile fields + `trades_from_*` push prefs (§3), the jeton-reaction note (§7.4), `trade_received` push gating (§8.4), and the wallet/inventory/trades/marketplace/pets/reputation rows in the migration carryover table (§10.1). Migration is now free. §14.1 already documented the pivot; this aligns the rest of the spec with it. No wire-breaking changes. (Cross-island federation — home-island records, `uin@host`, room-host groups, multihoming — is specified separately in `docs/federation-protocol.md` and is not yet folded into this document.) |
