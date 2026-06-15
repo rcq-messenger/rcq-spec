@@ -41,7 +41,7 @@ Out of scope:
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1.1**. Last updated: **2026-05-27**. Spec maintainer:
+Version: **v1.3**. Last updated: **2026-06-11**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 
 ## 1. Overview
@@ -1097,8 +1097,10 @@ See Section 7-equivalent endpoints under `/groups/...`:
   self-leave. Owner-leave promotes oldest member to owner; if
   the group is empty after, the group row is deleted.
 - `PATCH /groups/{id}` — partial update of group metadata
-  (name/description/avatar: admin+; post_policy, entry_price,
-  is_closed, members_hidden: owner only; pinned_text: admin+).
+  (name/description/avatar: admin+; post_policy, is_closed,
+  members_hidden: owner only; pinned_text: admin+). (`entry_price`
+  is still accepted by the owner-only set but is **vestigial** — the
+  column survives the 2026-05-27 economy pivot but is no longer charged.)
 - `DELETE /groups/{id}` — owner only; fans out `group_deleted`
   to every member.
 
@@ -1118,7 +1120,7 @@ Fields on the `Group` row:
 | `avatar_media_id`    | string|null| null        | admin            |
 | `avatar_media_key`   | string|null| null        | admin            |
 | `post_policy`        | enum       | `all`       | owner            |
-| `entry_price_tokens` | int|null   | null (free) | owner            |
+| `entry_price_tokens` | int|null   | null (free) | owner (vestigial; column present but unused since the 2026-05-27 economy pivot) |
 | `is_closed`          | bool       | false       | owner            |
 | `members_hidden`     | bool       | false       | owner            |
 | `pinned_text`        | string(500)| null        | admin            |
