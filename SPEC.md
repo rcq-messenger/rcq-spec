@@ -1623,6 +1623,25 @@ Delivery is scheduled off the request path: the sender's HTTP request
 never waits on a third-party push server. The final outcome per
 endpoint is recorded and exposed through `GET /users/me/push-health`
 (§3.5).
+
+**Embedded distributor (Android client, since v0.74).** The reference
+client ships its own distributor rather than requiring the user to
+install one: a receiver answering REGISTER / UNREGISTER in-process, and
+a foreground service holding one WebSocket to the operator's own push
+server (`push.rcq.app` for the flagship). It mints its topic from a
+CSPRNG and returns `https://<push-host>/<topic>?up=1` as the endpoint,
+so everything above is unchanged — on the wire the server cannot tell an
+embedded distributor from ntfy, and does not need to. On reconnect the
+client resumes from the last delivered message id, so a wake published
+while the device was offline is replayed from the push server's cache
+instead of being lost. Any other UnifiedPush distributor stays
+selectable: this is a default, not a lock-in.
+
+An operator running their own island should run their own push server
+too. The settings that matter are the two that made the public instance
+unusable: `visitor-subscriber-rate-limiting` OFF, a per-visitor request
+bucket sized for group fan-out, and the island's own address exempt from
+that bucket.
 - Cross-environment retry: if the primary host (configured via
   `APNS_ENVIRONMENT`) returns `BadEnvironmentKeyInToken` (403)
   or `BadDeviceToken` (400), the same payload is retried
