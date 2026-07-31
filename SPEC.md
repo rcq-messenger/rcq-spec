@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.3)
+# RCQ Protocol Specification (v1.4)
 
 ## 0. Status & Scope
 
@@ -18,7 +18,7 @@ In scope:
 - Per-recipient group fanout, group membership, group settings.
 - WebSocket channel (presence, typing, reactions, call signalling).
 - APNs push (alert + VoIP), including the Notification Service
-  Extension flow.
+  Extension flow, and UnifiedPush for Android (no FCM).
 - Encrypted media blob upload/download with per-blob key exchange
   inside the encrypted envelope.
 - Account migration (move identity to a fresh UIN) and burn (wipe).
@@ -453,15 +453,41 @@ viewpoint (so the response includes the owner-only echo fields).
 `POST /users/me/push-token`:
 
 ```json
-{ "token": "<APNs device token>", "platform": "ios" | "ios-voip" }
+{ "token": "<APNs device token | UnifiedPush endpoint URL>",
+  "platform": "ios" | "ios-voip" | "android-up",
+  "device_id": "<stable per-install id>"   // optional
+}
 ```
 
 Idempotent on `(uin, token)` via Postgres `INSERT ... ON
-CONFLICT DO UPDATE`; bumps `last_seen` on conflict. `204 No
-Content`.
+CONFLICT DO UPDATE`; bumps `last_seen` and clears any recorded push
+failure on conflict. `204 No Content`.
+
+For `platform: "android-up"` the `token` is the whole address: the
+HTTPS endpoint URL the device's UnifiedPush distributor handed out
+(see §8.7). There is no provider key anywhere on the server.
 
 `DELETE /users/me/push-token`: same body shape; removes the
 matching row if present (no error if absent).
+
+`GET /users/me/push-health`:
+
+```json
+{ "devices": [
+  { "platform":      "android-up",
+    "host":          "ntfy.sh",          // host only, never the full endpoint
+    "last_error":    "507",              // null once a wake gets through
+    "last_ok":       "<ISO-8601 | null>",
+    "registered_at": "<ISO-8601>" }
+] }
+```
+
+What the server's last wake attempt to each registered device did.
+Android push depends on a third-party distributor the user chose, and
+when that distributor stops accepting wakes the user's experience is
+"notifications stopped" with nothing to look at; this is the surface a
+client uses to say so. The endpoint path is never echoed back — for a
+UnifiedPush topic the path IS the wake secret.
 
 `GET /users/me/push-preferences`:
 
@@ -1005,6 +1031,18 @@ whichever drains first removing them for the other. A queued row is
 reaped only once EVERY device's cursor has passed it (the per-UIN TTL
 sweep backstops abandoned cursors).
 
+Retention (server policy, not wire): a background sweep deletes queued
+rows older than `OFFLINE_QUEUE_TTL_DAYS` (default 30). GROUP rows carry
+a second rule — they are also deleted once the recipient has not
+connected for `OFFLINE_GROUP_DORMANT_DAYS` (default 14, `users.last_seen`
+being refreshed on WS connect, heartbeat and disconnect). Group fan-out
+writes one row per member, so without it a busy group multiplies its
+traffic by its entire membership and holds the product for a month,
+overwhelmingly for accounts that never return to drain it. The 1:1 queue
+is exempt: a direct message is worth holding the full TTL. A client that
+has been away longer than the dormant window should therefore expect
+group history to resume from its return, not from its departure.
+
 Query params:
 
 - `ack` (bool, default `false`).
@@ -1528,6 +1566,63 @@ APNs alert is suppressed for muted groups.
 - Pruned automatically on APNs response codes 400
   `BadDeviceToken`, 410 `Unregistered`, and 403
   `BadEnvironmentKeyInToken`.
+
+### 8.7 UnifiedPush (Android)
+
+Google services are unreachable in the target region, so the Android
+client does not use FCM. It registers a **UnifiedPush endpoint**: a
+plain HTTPS URL issued by whatever distributor the user runs (ntfy.sh,
+a self-hosted ntfy, a WebPush distributor). The server is deliberately
+dumb — it HTTP-POSTs the wake to that URL. There is no provider API
+key and no hardcoded gateway; the endpoint URL is the whole address.
+Registration rides the same `POST /users/me/push-token` with
+`platform: "android-up"` (§3.5), and so inherits the burn cascade and
+the `DELETE` cleanup.
+
+Wake payload (JSON body):
+
+```json
+{ "v": 1, "type": "msg" | "call", "to_uin": <int>,
+  "title": "<string>", "body": "<string>",
+  "env":   "<base64 sealed envelope>",   // opaque, already E2E-encrypted
+  "envType":    "message" | "gmsg" | "secscreen" | "system",
+  "thread_id":  "<string>",   "notif_kind": "<string>",
+  "group_id":   <int>,        "group_name": "<string>" }
+```
+
+`type: "call"` carries the flat call dict (`call_id`, `from_uin`,
+`nickname`, `media`, `sdp`) instead, mirroring the VoIP push of §8.3.
+The push server sees ciphertext only: the same opaque envelope APNs
+carries, so the exposure matches Apple's on the iOS path.
+
+Request headers: `Content-Type: application/json`, plus RFC 8030
+`TTL` (86400s for a message wake, 60s for a call wake — a stale call
+wake is worthless) and `Urgency: high`. `TTL` is mandatory for WebPush
+endpoints; omitting it makes Mozilla autopush reject the POST with 400.
+
+Response handling, per endpoint:
+
+| Status | Action |
+|--------|--------|
+| 2xx | delivered |
+| 404, 410 | registration is gone — drop the endpoint row |
+| 408, 429, 5xx (incl. 507) | retry with jittered backoff (~30s total), then record the failure |
+| anything else | permanent rejection — record it, keep the endpoint |
+
+The retry schedule is not optional politeness. Public ntfy answers
+`507` when the topic has no currently connected subscriber, and `429`
+when a rate bucket is drained — and ntfy charges that bucket to the
+**subscriber**, so users sharing a carrier NAT share one bucket. Both
+states flap within seconds, and dropping the wake on first failure
+loses a notification the distributor would have accepted moments later.
+Neither check exempts an authenticated publisher, so a paid account on
+the public instance does not change the arithmetic; an operator who
+needs reliable Android push should run their own push server.
+
+Delivery is scheduled off the request path: the sender's HTTP request
+never waits on a third-party push server. The final outcome per
+endpoint is recorded and exposed through `GET /users/me/push-health`
+(§3.5).
 - Cross-environment retry: if the primary host (configured via
   `APNS_ENVIRONMENT`) returns `BadEnvironmentKeyInToken` (403)
   or `BadDeviceToken` (400), the same payload is retried
@@ -2124,3 +2219,4 @@ the change log below.
 | v1.1    | 2026-05-27 | Pivot pass. Section 14 trimmed: cut routers documented as removed; UIN shop + IAP-priced hood banners documented as the only paid surfaces (mock receipt). No wire-breaking changes to the messaging core. |
 | v1.2    | 2026-06-04 | Documented two shipped additive features. New §2.7 Account recovery (opt-in BIP39 seed phrase, `POST /auth/recover/challenge` + `POST /auth/recover` Ed25519 challenge/response; 48-word legacy raw-key export) — corrects the earlier "recovery is not possible" framing. New §5.6 Multi-device (secondary devices: `POST /keys/devices`, `GET /keys/{uin}/devices`, `GET /keys/{uin}/devices/{device_id}/bundle`, per-device OPK pools, `device_id` + `sealed_sender_pub` bundle fields, sender fan-out). No wire-breaking changes. |
 | v1.3    | 2026-06-11 | Economy scrub: removed all remaining inline references to the gamification/economy layer that the 2026-05-27 pivot cut but earlier passes had left dangling in the live sections — jeton media pricing (uploads are now flat-free to the 2 GB safety cap, §9.1/§9.2/§9.5), premium media unlock (§9.7 deleted), paid groups (§6.4 join/invite + the related 402/`paid_group_*` error codes), the `equipped_pet`/`trade_policy`/`reputation`/`reputation_visibility` profile fields + `trades_from_*` push prefs (§3), the jeton-reaction note (§7.4), `trade_received` push gating (§8.4), and the wallet/inventory/trades/marketplace/pets/reputation rows in the migration carryover table (§10.1). Migration is now free. §14.1 already documented the pivot; this aligns the rest of the spec with it. No wire-breaking changes. (Cross-island federation — home-island records, `uin@host`, room-host groups, multihoming — is specified separately in `docs/federation-protocol.md` and is not yet folded into this document.) |
+| v1.4    | 2026-07-31 | Android push documented at last: new §8.7 UnifiedPush (endpoint registration with `platform: "android-up"`, wake payload, mandatory RFC 8030 `TTL`, the retry/prune table and why `507`/`429` from a public ntfy are retryable rather than fatal), `GET /users/me/push-health` and the widened `POST /users/me/push-token` in §3.5, and the offline-queue retention rules in §6.3.1 (30-day TTL plus the 14-day dormant-recipient rule that group rows are subject to and 1:1 rows are not). Documents shipped behaviour; no wire-breaking changes. |
