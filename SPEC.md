@@ -2157,7 +2157,19 @@ protocol:
   account-migration helper from Section 10)
 - `/reports` — moderation queue, including the bug-bounty
   context tag (`context = "bug_bounty"`); no monetary reward
-  is associated with the submission
+  is associated with the submission. Two endpoints face the
+  reporter rather than the operator: `GET /reports/mine`
+  returns that account's own reports with the operator's
+  answer (`reply`, `replied_at`) and never the internal
+  `resolution_notes`, and `DELETE /reports/mine/{id}` lets a
+  reporter withdraw one of their own. The delete refuses with
+  409 while a report about ANOTHER user is still open, so an
+  accusation cannot be filed, act, and then be erased. The
+  answer is deliberately NOT delivered as a chat message: the
+  server holds no keys and composes no envelopes, so a
+  server-written "message" would be exactly the capability
+  this protocol promises the operator does not have. The push
+  that announces an answer carries no part of its text
 - `/news`, `/polls`, `/polls/group` — admin-posted feed,
   global polls, per-group polls
 - `/referrals` — invite-tracking only; no reward attached
