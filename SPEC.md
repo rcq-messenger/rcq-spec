@@ -1156,7 +1156,19 @@ See Section 7-equivalent endpoints under `/groups/...`:
 
 - `POST /groups` — create.
 - `GET /groups` — list groups the caller is a member of.
-- `GET /groups/{id}` — full info (members + settings).
+  - `?members=0` returns every group **without its roster**: `members` comes
+    back empty and `member_count` carries the number. This is what a chat list
+    actually needs, and the roster is the expensive half of a group payload —
+    every member with two base64 keys, which on a group of a couple of thousand
+    people is hundreds of kilobytes on every poll. The default stays ON, so a
+    client written before this parameter existed is unaffected.
+  - ⚠ A client that opts out **must** fetch the roster from `GET /groups/{id}`
+    before anything that encrypts per recipient. Sealing against an empty
+    roster produces no ciphertexts at all, and the send paths cannot tell that
+    apart from a group with nobody in it: the message is reported as sent and
+    reaches no one.
+- `GET /groups/{id}` — full info (members + settings). Always carries the
+  roster; this is where a roster-less client comes to get one.
 - `GET /groups/{id}/preview` — lightweight info for a non-member
   considering joining (carries name, description, member count,
   owner nickname, avatar; does NOT carry membership or history).
@@ -1199,6 +1211,24 @@ Fields on the `Group` row:
 | `pinned_text`        | string(500)| null        | admin            |
 | `pinned_at`          | datetime|null | null     | (auto-stamped)   |
 | `pinned_by`          | int|null   | null        | (auto-stamped)   |
+
+Every group payload also carries `member_count`, which is the size of the
+roster whether or not the roster itself was sent (see `?members=0` above).
+
+#### 6.4.3a Roster rows
+
+Each entry of `members[]`:
+
+| Field                 | Notes                                                          |
+|-----------------------|----------------------------------------------------------------|
+| `uin`, `nickname`     |                                                                 |
+| `role`                | `owner` / `admin` / `member`                                    |
+| `permissions`         | subset of `delete` / `members` / `info`; empty for a plain member |
+| `status`              | live presence, `invisible` reported as `offline`                |
+| `identity_key`, `signing_key` | X25519 + Ed25519, base64 — what a sender encrypts to     |
+| `signal_identity_key` | non-null = this member runs libsignal (Stage 3 eligible)        |
+| `sender_keys`         | this member understands the `gmsg` / `skdm` group path          |
+| `avatar_media_id`, `avatar_media_key` | profile picture, gated by MEMBERSHIP rather than by the contact list: sharing a group is the relationship here, the same one that already exposes the nickname on this row |
 
 #### 6.4.4 Post policy
 
@@ -1376,6 +1406,7 @@ Recipient sees:
 ```json
 { "type": "group_created",             "group": <GroupOut> }
 { "type": "group_membership_changed",  "group": <GroupOut> }
+{ "type": "group_membership_changed",  "group_id": <int> }
 { "type": "group_deleted",             "group_id": <int> }
 ```
 
@@ -1384,6 +1415,18 @@ response. `group_membership_changed` is the universal
 "something about this group's roster or settings changed"
 event — clients should re-render their local state from the
 embedded object.
+
+⚠ Above **100 members** that event carries `group_id` alone and no `group`.
+The snapshot runs about 350 bytes per member and is sent once PER member, so
+on a group of two thousand a single join became gigabytes of fan-out and
+stalled call signalling behind it for tens of seconds. A client that only
+knows the fat form reads `group`, finds nothing, and does nothing — picking
+the change up on its next refresh, which is the intended degradation.
+
+⚠ An empty `members[]` in any of these is **not** a statement that the roster
+is empty, and in particular not that the reader was removed from the group.
+Roster-less payloads are normal now, from both `?members=0` and the compact
+form above.
 
 #### 7.4.6 Account events
 
