@@ -41,8 +41,30 @@ Out of scope:
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1.6**. Last updated: **2026-08-04**. Spec maintainer:
+Version: **v1.6**. Last updated: **2026-08-16**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
+
+⚠ **Known gaps, measured 2026-08-16.** The live server exposes 149 paths.
+Most of the ones absent here are absent on purpose (everything under "Out
+of scope" above, plus federation, which lives in `federation-protocol.md`).
+But eighteen IN-SCOPE endpoints are not described anywhere in this
+document, and pretending otherwise helps nobody:
+
+- Multi-device: `/devices/link`, `/devices/me`, `/auth/device`,
+  `/keys/devices/{device_id}/prekeys`. The device model is core messaging
+  and section 5 still reads as if a UIN has exactly one device.
+- Registration proof: `/auth/register/challenge`, `/auth/reissue`.
+- Contact graph: `/contacts/outgoing`, `/contacts/outgoing/{to_uin}` —
+  outgoing requests, which section 4 describes only from the receiving end.
+- Groups: `/groups/{group_id}/members/{member_uin}/permissions` (moderator
+  caps) and `/messages/group-broadcast` (the sender-key broadcast — one
+  ciphertext for the whole group, the thing §6.5 is about).
+- Deposit auth (F3): `/deposit-auth/issue`, `/deposit-auth/params`.
+- Capability negotiation: `/users/me/capabilities`, `/server/info`.
+- Minor: `/gate/check`, `/gate/redeem`, `/link/{token}`, `/health`.
+
+Reproduce the list with `GET /openapi.json` and grep this file for each
+path. Do that before claiming the spec is current.
 
 ## 1. Overview
 
@@ -884,10 +906,32 @@ not enforce the list):
 | `reaction`      | Emoji reaction toggle                                           |
 | `bounce`        | Delivery failure relay                                          |
 | `visit`         | "Saw your profile" pulse                                        |
+| `secscreen`     | Secure-mode state for a thread                                  |
+| `skdm`          | Sender-key chain distribution (§6.5)                            |
+| `sknack`        | Sender-key recovery request (§6.5)                              |
+| `call`          | Cross-island call signalling (`federation-protocol.md` §5d)     |
+| `carbon`        | Copy of your own send, to your other devices                    |
+| `homerec`       | Silent sync of a signed home-island record                      |
+| `profile`       | Cross-island name/picture refresh (§5e)                         |
+| `contactreq`    | Cross-island contact request (§5f)                              |
 
-Only `message` and `system` envelopes trigger push notifications.
-The rest are "delivery-state plumbing or cosmetic" (rate limiter
-+ envelope type filter `_PUSHABLE_TYPES`).
+Push is fired for `{message, system, secscreen}` (`_PUSHABLE_TYPES`);
+everything else is delivery-state plumbing or cosmetic and raises no
+banner.
+
+⚠ `call` is the one exception to "not pushable means not woken".
+Since 2026-08-15 a `call` deposit for a recipient with no live socket
+fires the SAME wake a same-island `call_offer` fires — PushKit VoIP on
+iOS, the UnifiedPush call payload on Android — and deliberately NOT an
+ordinary message alert as well. It is not in `_PUSHABLE_TYPES` because
+it must not raise a message banner. A call that does not ring is not a
+call.
+
+⚠ `skdm` and `sknack` are never pushed and must never be DROPPED either.
+The dormant-member sweep skips group backlog for people who have been
+away a long time; key material is exempt (`_SENDER_KEY_CONTROL`), because
+without the chain key a member cannot read a single later broadcast and
+the client cannot tell "no messages" from "cannot decrypt".
 
 **v=1 sealed-sender envelope** (when the recipient has not
 uploaded a libsignal bundle). Layout — opaque to the server,
@@ -957,8 +1001,9 @@ Behaviour:
   still lose them mid-flight, so the queue acts as the
   reconciliation source on next drain.
 - If the recipient is offline AND `envelope_type ∈ {message,
-  system}`, an APNs push fires carrying the envelope as
-  `userInfo["env"]` (see Section 8).
+  system, secscreen}`, an APNs push fires carrying the envelope as
+  `userInfo["env"]` (see Section 8). `call` fires the VoIP/call wake
+  instead, never a message alert.
 
 Response:
 
