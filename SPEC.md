@@ -47,21 +47,16 @@ the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 ⚠ **Known gaps, measured 2026-08-16.** The live server exposes 149 paths.
 Most of the ones absent here are absent on purpose (everything under "Out
 of scope" above, plus federation, which lives in `federation-protocol.md`).
-But eighteen IN-SCOPE endpoints are not described anywhere in this
-document, and pretending otherwise helps nobody:
+Of the eighteen IN-SCOPE endpoints that were undocumented, fourteen were
+written up the same day: multi-device (§2.9, §2.11), registration proof
+(§2.8), key rotation (§2.10), capability negotiation (§2.12), server info
+(§2.13), outgoing contact requests (§4.8), the sender-key group broadcast
+(§6.5) and moderator permissions (§6.6).
 
-- Multi-device: `/devices/link`, `/devices/me`, `/auth/device`,
-  `/keys/devices/{device_id}/prekeys`. The device model is core messaging
-  and section 5 still reads as if a UIN has exactly one device.
-- Registration proof: `/auth/register/challenge`, `/auth/reissue`.
-- Contact graph: `/contacts/outgoing`, `/contacts/outgoing/{to_uin}` —
-  outgoing requests, which section 4 describes only from the receiving end.
-- Groups: `/groups/{group_id}/members/{member_uin}/permissions` (moderator
-  caps) and `/messages/group-broadcast` (the sender-key broadcast — one
-  ciphertext for the whole group, the thing §6.5 is about).
-- Deposit auth (F3): `/deposit-auth/issue`, `/deposit-auth/params`.
-- Capability negotiation: `/users/me/capabilities`, `/server/info`.
-- Minor: `/gate/check`, `/gate/redeem`, `/link/{token}`, `/health`.
+Still undocumented, and small: `/deposit-auth/issue`, `/deposit-auth/params`
+(F3 deposit authorisation), `/gate/check`, `/gate/redeem`, `/link/{token}`,
+`/health`. `/groups/{group_id}/polls` is polls, which section 14 puts out
+of scope, and it is listed here only because its path lives under groups.
 
 Reproduce the list with `GET /openapi.json` and grep this file for each
 path. Do that before claiming the spec is current.
@@ -332,6 +327,95 @@ working, v=2 sessions re-bootstrap. Running the same identity on
 two live devices at once is a migration, not multi-device: the
 v=2 ratchet desyncs (see Section 13). For a per-device identity
 that coexists, see Section 5.6.
+
+### 2.8 `POST /auth/register/challenge` (registration proof)
+
+Registration mints an identity from public keys the caller supplies. On
+its own that lets anyone claim a signing key they do not hold, so the
+flow is two-step: ask for a nonce, sign it, register with the signature.
+
+```
+POST /auth/register/challenge
+  { "signing_key": "<base64 Ed25519 public>" }
+→ { "challenge": "<opaque short-lived nonce>" }
+```
+
+The nonce is stateless and deliberately says NOTHING about whether that
+key or any account already exists, so it cannot be used to probe for
+either. `POST /auth/register` then takes the challenge plus an Ed25519
+signature over it and refuses if the signature does not verify.
+
+Rate limit: 60 per hour per caller.
+
+### 2.9 `POST /auth/device` (name the install)
+
+A token issued before multi-device carries no `dev` claim, and every such
+client keys as "primary". Two installs on one UIN therefore knock each
+other's websockets over in a loop and share ONE offline-queue cursor, so
+whichever drains first leaves the other with nothing.
+
+This cannot be repaired server-side, because only the client knows which
+install it is. So: call this once after updating and keep the token you
+get back. The current queue cursor is copied onto the new device id — a
+new id starting at zero would be handed the entire backlog again, which
+is harmless (clients dedupe by envelope id) but is a pointless
+re-download of everything the person already has.
+
+```
+POST /auth/device   (bearer: the old token)
+  { "device_id": "<client-chosen stable id>", "label": "<optional>" }
+→ { "uin": <int>, "token": "<jwt with a dev claim>" }
+```
+
+### 2.10 `POST /auth/reissue` (rotate identity keys in place)
+
+Replaces the account's `identity_key` and `signing_key` without changing
+the UIN, and returns a fresh token. The contact graph, groups and queue
+are untouched; peers re-pin on next contact.
+
+⚠ Existing libsignal sessions do not survive a key rotation — peers
+re-handshake. This is not the same operation as §10 migration, which
+changes the number and keeps the keys.
+
+### 2.11 Linked devices
+
+```
+POST   /devices/link                       issue a linking payload for a second install
+GET    /devices                            list this account's devices
+DELETE /devices/me                         revoke the device the caller is using
+DELETE /devices/{id}                       revoke another device of this account
+POST   /keys/devices/{device_id}/prekeys   replenish that device's one-time prekey pool
+```
+
+⚠ Each device keeps its OWN one-time prekey pool (§5). They are scoped so
+a phone re-bootstrapping its keys cannot drain or wipe a second device's
+pool — the two are independent, and a shared pool would mean whichever
+device published last silently broke sessions for the other.
+
+Revocation is announced to the account's other devices over the socket,
+so a revoked install is dropped live rather than at its next request.
+
+### 2.12 `POST /users/me/capabilities`
+
+How a client tells the island what it can parse. Idempotent, so clients
+fire it on every start without tracking whether they already did.
+
+```
+POST /users/me/capabilities
+  { "sender_keys": true }
+→ 204
+```
+
+★ This is not decoration: `sender_keys` is what §6.5 group broadcast
+routes on. A member whose client has not advertised it is deliberately
+skipped by the broadcast and covered by the legacy per-member fan-out
+instead, because they cannot parse a `gmsg` and would simply see nothing.
+
+### 2.13 `GET /server/info`
+
+What this island is and what it has switched on — read before the client
+offers a feature that an operator may have disabled. Self-hosted islands
+answer with their own values.
 
 ## 3. User Profile & Visibility
 
@@ -670,6 +754,21 @@ consulted by group membership flows:
   group by anyone else.
 - A user is filtered out of the presence watcher set if they're
   on the user's block list.
+
+### 4.8 `GET /contacts/outgoing` (requests you sent)
+
+Section 4.4 covers the requests waiting for YOU. This is the other half:
+the ones you sent and nobody has answered. Without it a client can only
+show a request from the receiving side, which is why "did that even go
+out?" had no answer in the UI.
+
+```
+GET    /contacts/outgoing              → [ { to_uin, nickname, created_at } ]
+DELETE /contacts/outgoing/{to_uin}     withdraw a request you sent
+```
+
+Withdrawing removes the pending row on both sides; it is not a block and
+leaves no trace for the other person beyond the request disappearing.
 
 ## 5. Cryptographic Keys & Prekey Publishing
 
@@ -1320,6 +1419,96 @@ banner exists so the rules / welcome / link-of-the-day are
 visible immediately upon joining. The exception is scoped to
 this single 500-character field. Implementations MUST treat
 the pinned text as group metadata, not user message content.
+
+### 6.5 Sender keys: one ciphertext for the whole group
+
+§6.4 seals a group message once per member. That is O(N) crypto and O(N)
+upload for the sender, and on a group of two thousand it is the reason
+posting felt like uploading a file. Sender keys make it O(1): the sender
+encrypts ONCE under a chain key the members already hold, and the island
+fans the same bytes out.
+
+**Chain.** A sender owns one chain per (group, sender), identified by a
+16-byte `kid` and an epoch `e`. Message keys ratchet forward per message
+index `i`:
+
+```
+mk_i  = HMAC-SHA256(ck_i, 0x01)
+ck_i+1 = HMAC-SHA256(ck_i, 0x02)
+```
+
+Forward-only: holding `ck_i` gives every later message and no earlier
+one. The chain is rotated (new `kid`, `e+1`) when a member who held it
+leaves, so a removed member cannot read what is posted after they go.
+
+**Distribution.** The chain key travels per-member over the ordinary
+sealed channel as an `skdm` envelope (§6.1), never over the broadcast:
+
+```json
+{ "kind": "skdm", "gid": 42, "kid": "<b64 16B>", "e": 0,
+  "i": 7, "ck": "<b64 32B chain key at index i>" }
+```
+
+`i` is the first index that member can decrypt, so somebody added
+mid-conversation gets the chain from the point they joined and not the
+history before it. A member who receives a `gmsg` for a `kid` they do not
+hold answers with `sknack` (`{kind, gid, kid}`) and the sender re-sends
+the `skdm`.
+
+⚠ `skdm` and `sknack` are exempt from the dormant-queue sweep. See §6.1:
+dropping one costs that member the whole group, silently, because the
+client cannot tell "no messages" from "cannot decrypt".
+
+**Wire.** The broadcast payload is base64(JSON):
+
+```json
+{ "v": 1, "kid": "<b64 16B>", "e": 0, "i": 7,
+  "n": "<b64 12B nonce>", "ct": "<b64 ChaCha20-Poly1305 ct||tag>" }
+```
+
+AAD is the ASCII string `rcq.gmsg.v1|<gid>|<kid>|<e>|<i>`.
+
+★ The sender's Ed25519 signature over `AAD || envelope-bytes` lives
+INSIDE the AEAD, not beside it. Every member holds the chain key, so the
+chain key alone proves only "someone in this group wrote this" — the
+signature is what says WHO, and putting it inside means a member cannot
+strip or swap it without breaking the tag.
+
+**Transport.**
+
+```
+POST /messages/group-broadcast
+  { "group_id": 42, "payload": "<base64 gmsg wire>" }
+→ { "delivered": <int>, "queued": <int>, "server_time": "<iso>" }
+```
+
+Rate limit 120/min — the same budget as a 1:1 send, because it is now one
+small POST per message whatever the group size.
+
+**Who is skipped.** The island fans out only to members whose client has
+advertised `sender_keys` (§2.12). Everyone else is deliberately left out
+of the broadcast and covered by the sender's legacy per-member fan-out in
+the same send, because a client that cannot parse `gmsg` would otherwise
+receive bytes it can only discard. Both halves ship together; this is the
+"dual send".
+
+### 6.6 `POST /groups/{group_id}/members/{member_uin}/permissions`
+
+Moderator capabilities, a subset of `delete | members | info`:
+
+| cap       | what it allows                                  |
+|-----------|-------------------------------------------------|
+| `delete`  | retract another member's message for everyone   |
+| `members` | remove members                                  |
+| `info`    | edit name, description, picture, pinned message |
+
+The owner holds all three implicitly and is the only caller who may grant
+them. ⚠ `members` is about taking people OUT. Any member may pull someone
+IN (`POST /groups/{id}/members`) — an admin gate there would make small
+groups feel locked, and the owner's block list is enforced regardless.
+
+Recipients re-check the same rule on receipt; a moderator action is not
+trusted because the sender claims it.
 
 ## 7. WebSocket Channel
 
