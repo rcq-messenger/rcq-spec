@@ -317,6 +317,10 @@ session token. Errors: `400 invalid_challenge` / `missing_key`,
 `401 bad_signature`, `404 identity_not_found`. (The `signing_key`
 column is indexed for this lookup.)
 
+A client that already knows its own UIN should ask §2.14
+`POST /auth/refresh` instead: same proof, but bound to the account it
+means, so a shared signing key cannot land the session somewhere else.
+
 **Scope of recovery.** Restores the UIN, identity, and
 server-side data (contacts, groups, pending requests). Local
 message **history is not** restored — it is device-only E2E state
@@ -416,6 +420,53 @@ instead, because they cannot parse a `gmsg` and would simply see nothing.
 What this island is and what it has switched on — read before the client
 offers a feature that an operator may have disabled. Self-hosted islands
 answer with their own values.
+
+### 2.14 `POST /auth/refresh` (a token without storing one)
+
+Same proof as recovery (§2.7), but the caller names the UIN it wants and
+gets a token only if that account actually carries the key.
+
+```
+POST /auth/recover/challenge     { "signing_key": "<base64 Ed25519 pub>" }
+→ { "challenge": "..." }
+
+POST /auth/refresh
+  {
+    "uin":         <int>,
+    "signing_key": "<base64 Ed25519 pub>",
+    "challenge":   "<from the challenge step>",
+    "signature":   "<base64 Ed25519 signature over the challenge string>",
+    "device_id":   "<optional: the install asking>"
+  }
+→ { "uin": <int>, "token": "<JWT>" }
+```
+
+Errors: `400 invalid_challenge`, `401 bad_signature`,
+`404 identity_not_found`. Rate limit: 60 per hour per caller.
+
+**Why it is not §2.7.** `/auth/recover` resolves a signing key to the
+OLDEST account carrying it — the right rule for "I lost my device, take me
+home", and the wrong one for a client that already knows which account it
+is: a key shared by more than one account (which happens, since
+registration accepted unproven keys for a long time) would send the
+session to somebody else's UIN. Naming the UIN removes the ambiguity and
+gives nothing away — possession of the private key is still the only thing
+that mints a token.
+
+**What it is for.** A client that can mint a token on demand does not need
+to keep one. The web client stores no session token between visits
+(`docs/web-storage-inventory.md`): a 30-day bearer sitting beside the keys
+that can produce it is one more thing to lose and buys its owner nothing.
+It also ends a session at the token's expiry instead of the account's —
+before this, a browser simply fell out of its account after 30 days.
+
+⚠ Not an end-run around revocation. A revoked install's `device_id` stays
+denylisted, so the token this returns is refused exactly as the old one
+was, and the client signs itself out.
+
+If `device_id` names an install with no queue cursor, one is created at the
+account watermark — never at zero, or the next drain replays the entire
+queue as notifications (the 2026-08-13 drain-floor bug).
 
 ## 3. User Profile & Visibility
 
