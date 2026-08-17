@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.6)
+# RCQ Protocol Specification (v1.7)
 
 ## 0. Status & Scope
 
@@ -2527,19 +2527,29 @@ protocol:
   account-migration helper from Section 10)
 - `/reports` — moderation queue, including the bug-bounty
   context tag (`context = "bug_bounty"`); no monetary reward
-  is associated with the submission. Two endpoints face the
-  reporter rather than the operator: `GET /reports/mine`
-  returns that account's own reports with the operator's
-  answer (`reply`, `replied_at`) and never the internal
-  `resolution_notes`, and `DELETE /reports/mine/{id}` lets a
-  reporter withdraw one of their own. The delete refuses with
-  409 while a report about ANOTHER user is still open, so an
-  accusation cannot be filed, act, and then be erased. The
-  answer is deliberately NOT delivered as a chat message: the
-  server holds no keys and composes no envelopes, so a
-  server-written "message" would be exactly the capability
-  this protocol promises the operator does not have. The push
-  that announces an answer carries no part of its text
+  is associated with the submission. Three endpoints face the
+  reporter rather than the operator. `GET /reports/mine`
+  returns that account's own reports and never the internal
+  `resolution_notes`; each carries `reply` + `replied_at` (the
+  LAST operator answer) and `thread`, the whole exchange
+  oldest-first as `{id, from_admin, body, created_at}`. A
+  client that predates the thread reads `reply` alone and
+  still shows the newest answer. `POST /reports/mine/{id}/messages`
+  (`{"body": "…"}`, 1–4000 chars, 20/hour) adds the reporter's
+  own turn: only on their own report, only while its status is
+  `open` — a closed one answers 409 with code `closed` and
+  stays readable. Deliberately NOT gated on the island's
+  "reports open" switch: intake can be closed while a
+  conversation already under way must still be finishable.
+  `DELETE /reports/mine/{id}` lets a reporter withdraw one of
+  their own, refusing with 409 while a report about ANOTHER
+  user is still open, so an accusation cannot be filed, act,
+  and then be erased. None of this is delivered as a chat
+  message: the server holds no keys and composes no envelopes,
+  so a server-written "message" would be exactly the
+  capability this protocol promises the operator does not
+  have. The push that announces an answer carries no part of
+  its text
 - `/news`, `/polls`, `/polls/group` — admin-posted feed,
   global polls, per-group polls
 - `/referrals` — invite-tracking only; no reward attached
@@ -2606,7 +2616,7 @@ implementation already does) may go straight to PR.
 
 ### 15.2 Versioning
 
-This document is **v1.6**. The protocol wire major is still v1;
+This document is **v1.7**. The protocol wire major is still v1;
 the `.x` suffix tracks doc revisions. Wire-breaking changes would
 bump the major. Additive endpoints, new optional fields, and new
 envelope types do not require a major bump; they are recorded in
@@ -2622,4 +2632,5 @@ the change log below.
 | v1.3    | 2026-06-11 | Economy scrub: removed all remaining inline references to the gamification/economy layer that the 2026-05-27 pivot cut but earlier passes had left dangling in the live sections — jeton media pricing (uploads are now flat-free to the 2 GB safety cap, §9.1/§9.2/§9.5), premium media unlock (§9.7 deleted), paid groups (§6.4 join/invite + the related 402/`paid_group_*` error codes), the `equipped_pet`/`trade_policy`/`reputation`/`reputation_visibility` profile fields + `trades_from_*` push prefs (§3), the jeton-reaction note (§7.4), `trade_received` push gating (§8.4), and the wallet/inventory/trades/marketplace/pets/reputation rows in the migration carryover table (§10.1). Migration is now free. §14.1 already documented the pivot; this aligns the rest of the spec with it. No wire-breaking changes. (Cross-island federation — home-island records, `uin@host`, room-host groups, multihoming — is specified separately in `docs/federation-protocol.md` and is not yet folded into this document.) |
 | v1.4    | 2026-07-31 | Android push documented at last: new §8.7 UnifiedPush (endpoint registration with `platform: "android-up"`, wake payload, mandatory RFC 8030 `TTL`, the retry/prune table and why `507`/`429` from a public ntfy are retryable rather than fatal), `GET /users/me/push-health` and the widened `POST /users/me/push-token` in §3.5, and the offline-queue retention rules in §6.3.1 (30-day TTL plus the 14-day dormant-recipient rule that group rows are subject to and 1:1 rows are not). Documents shipped behaviour; no wire-breaking changes. |
 | v1.6    | 2026-08-04 | Call signalling brought up to what the clients actually send (§7.4.7): the `call_ice_restart` / `call_ice_restart_answer` pair, the encoding of `sdp` (raw text) and of `candidate` (a JSON string whose candidate line is under the key `sdp`) — the two details a third implementation cannot guess and whose absence yields a silent call — multi-device ringing and the `answered_elsewhere` end reason, the enumerated end reasons, and the UnifiedPush call wake alongside the iOS VoIP push. Also corrects §0 and §15.2, which still stamped the document v1.3 (2026-06-11) after the v1.4 and v1.5 revisions. No wire change: all of it documents shipped behaviour. |
+| v1.7    | 2026-08-17 | Reports became a conversation (§14): `GET /reports/mine` now carries `thread` — the whole exchange, oldest first — beside the `reply` older clients read, and `POST /reports/mine/{id}/messages` lets the reporter write back on their own open report (20/hour, 409 `closed` on a resolved one, deliberately not gated on the island's reports-open switch). Documents shipped behaviour; additive, no wire break. |
 | v1.5    | 2026-07-31 | §8.7 gains the embedded distributor the Android client ships since v0.74 (own topic, own push server, resume-from-id on reconnect) and the operator guidance that goes with running one. No wire change: an embedded distributor is indistinguishable from ntfy on the wire. |
