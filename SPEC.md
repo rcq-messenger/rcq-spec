@@ -1641,7 +1641,8 @@ Dispatched for every WS-routed envelope (matches the
 ```json
 {
   "type":        "message" | "nudge" | "delete" | "system" |
-                 "read" | "reaction" | "bounce" | "visit",
+                 "read" | "reaction" | "bounce" | "visit" |
+                 "carbon",   // note-to-self and own-device echoes
   "payload":     "<base64>",
   "server_time": "<ISO>",
   "group_id":    <int>     // present for group sends only
@@ -1813,13 +1814,62 @@ audio-rooms feature spec — out of scope for this document.
 `hood_subscribe` / `hood_unsubscribe` from client. Server
 broadcasts `hood_count` updates to current bucket viewers.
 
-#### 7.4.10 Reactions, read receipts
+#### 7.4.10 Reactions, read receipts, delivery receipts
 
 Reactions and read receipts are transported as standard
 sealed-sender envelopes with `envelope_type: "reaction"` or
 `envelope_type: "read"`. There is no dedicated server event
 type; clients ingest them through the normal message path
 and apply local effects.
+
+**Delivery receipt** (2026-08-18). Inner kind `"delivered"`,
+same shape as the read receipt:
+
+```json
+{ "kind": "delivered", "targetIDs": ["<uuid>", ...] }
+```
+
+Sent by the RECIPIENT's client on ingest of a 1:1 message,
+whether or not the thread was opened. The original sender
+lifts those bubbles from SENT to DELIVERED, and never
+downgrades: a read receipt may arrive first.
+
+⚠ Why a client-to-client receipt and not a server signal.
+`SendOut.delivered` answers one question, once — "did the
+recipient have a live socket at the instant of this deposit"
+— and nothing revisits it, so a message written while the
+peer was offline keeps a single tick forever. The island
+cannot correct itself later either: a sealed deposit is
+unauthenticated, so when the recipient finally drains the
+queue the island does not know who sent the row it is
+handing over and has nobody to notify. Only the recipient's
+own client knows.
+
+⚠ The OUTER `envelope_type` stays `"read"`. It is already
+outside `_PUSHABLE_TYPES` and already in every client's
+live-routing set; a new outer label would be routed by no
+client until the whole field updated, which for a receipt
+means the tick stays broken for precisely the oldest builds.
+The inner `kind` carries the meaning.
+
+1:1 only. A group message has as many recipients as it has
+members and one tick cannot stand for all of them.
+
+⚠ Receivers MUST tolerate an unknown inner `kind` rather
+than failing the decode. A throw there turns every future
+wire addition into a landmine whose blast radius depends on
+which caller happens to hold the row — one message, or a
+whole queue drain.
+
+#### 7.4.11 Notes to self are carbons
+
+A note written in Saved Messages is addressed to the
+author's own uin, which is what puts it on their other
+devices. It MUST be sent with `envelope_type: "carbon"`,
+not `"message"`: under sealed sender the island cannot tell
+a note from a stranger's letter, so a `"message"` label
+makes it push, and the author's own phone rings for what
+they just typed.
 
 ### 7.5 `GET /users/me/turn-credentials`
 
