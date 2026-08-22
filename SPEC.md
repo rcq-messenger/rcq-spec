@@ -2267,8 +2267,18 @@ account's only one. The 30-day rule has no such exemption: it is checked first
 and consults nothing about siblings, so an account whose single cursor has gone
 untouched for 31 days loses it. The next drain from that install finds no
 cursor, and the account watermark is then computed over an empty set, which
-reads as zero. That install is served the whole surviving queue as fresh
-notifications, which is the replay this section exists to prevent.
+reads as zero.
+
+That is less alarming than it sounds, and saying it precisely matters. Every
+ack reaps the rows all live cursors have passed, so on a single-device account
+the rows below the lost cursor are already gone; a floor of zero serves only
+the surviving rows, which are exactly the ones this install had not drained.
+Losing a LONE cursor therefore replays nothing. The window that does re-serve
+is the multi-device one: when every cursor of an account has gone stale and
+all are dropped together, a returning install is re-served the rows it had
+drained but a lagging sibling had not (the slice between the old minimum and
+its own old cursor). Clients dedupe by envelope id, so this costs transfer,
+not duplicate messages.
 
 The shorter leash exists because the two cases are different animals. A phone
 switched off for a fortnight is indistinguishable from a dead install only
