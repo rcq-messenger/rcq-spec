@@ -49,24 +49,25 @@ the live server's 149 paths and has NOT been retaken; for v1.8 only the paths
 this revision touches were re-checked. Most of the ones absent here are absent
 on purpose (everything under "Out of scope" above, plus federation, which lives
 in `federation-protocol.md`). Of the eighteen IN-SCOPE endpoints that census
-found undocumented, fourteen were written up the same day: multi-device
-(§2.9, §2.11), registration proof (§2.8), key rotation (§2.10), capability
-negotiation (§2.12), server info (§2.13), outgoing contact requests (§4.8),
-the sender-key group broadcast (§6.5) and moderator permissions (§6.6).
+found undocumented, all but the six below were written up the same day:
+multi-device (§2.9, §2.11), registration proof (§2.8), key rotation (§2.10),
+capability negotiation (§2.12), server info (§2.13), outgoing contact requests
+(§4.8), the sender-key group broadcast (§6.5) and moderator permissions (§6.6).
 
-Still undocumented, and small: `/deposit-auth/issue`, `/deposit-auth/params`
-(F3 deposit authorisation, together with the optional `deposit_token` field
-they mint for `POST /messages/sealed`), `/gate/check`, `/gate/redeem`,
-`/link/{token}`, `/health`. `/groups/{group_id}/polls` is polls, which section
-14 puts out of scope, and it is listed here only because its path lives under
-groups.
+Those six, still undocumented and small: `/deposit-auth/issue`,
+`/deposit-auth/params` (F3 deposit authorisation, together with the optional
+`deposit_token` field they mint for `POST /messages/sealed`; §13.2 says what
+the mechanism is and that the reference island ships it switched off),
+`/gate/check`, `/gate/redeem`, `/link/{token}`, `/health`.
+`/groups/{group_id}/polls` is polls, which section 14 puts out of scope, and it
+is listed here only because its path lives under groups.
 
 v1.8 closed one endpoint that shipped after that census
 (`POST /keys/devices/{device_id}/revoke`, §5.6.3) and the field-level gaps a
 path census does not count: `cls`, `ring`, `to_device_id` and `seq` on the
 messaging path (§6.1.1, §6.2.1.1, §6.2.3, §6.3.1.3), sealed-payload padding
-(§6.1.2), the device key slots and their revoke cooldown (§5.6.1 to §5.6.4),
-and the session denylist (§2.11.1).
+(§6.1.2), the device key slots with their revoke cooldown and prekey
+replenish (§5.6.1 to §5.6.5), and the session denylist (§2.11.1).
 
 Reproduce the list with `GET /openapi.json` and grep this file for each
 path. Do that before claiming the spec is current.
@@ -241,10 +242,27 @@ returns to the allocator pool and may be reissued.
   - `sub`: the UIN as a string.
   - `iat`: issued-at, UTC seconds since epoch.
   - `exp`: expiry, UTC seconds since epoch. Default TTL is
-    `JWT_TTL_SECONDS = 60 * 60 * 24 * 30` (30 days).
+    `JWT_TTL_SECONDS = 60 * 60 * 24 * 30` (30 days) for an install
+    token, 90 days for a linked-device token (§2.11).
+  - `dev`: optional string, the install id this session names (§2.9).
+    Absent reads as the literal `"primary"` everywhere the island
+    keys on it: the drain cursor (§6.3.1.2), the websocket
+    registration (§7.1) and the revoke denylist (§2.11.1).
+  - `k`: `"phone"` on an install token, absent on a linked-device
+    token. It is the only thing separating the two, since both carry
+    `dev`.
+  - `ep`: optional int, the UIN epoch the token was minted under.
+    A number that has changed hands has a higher epoch, which is what
+    retires a previous holder's saved bearer (§10.1.3).
 - Signed with `JWT_SECRET` (deployment-specific). Tokens are
-  rejected on bad signature, missing `sub`, expired `exp`,
-  or unparseable `sub`.
+  rejected on bad signature, missing `sub`, unparseable `sub`, a
+  stale `ep`, or a denylisted `dev` (§2.11.1).
+- ⚠ `exp` is enforced for a linked-device token only (`dev` present,
+  `k` absent). An install token outlives its own `exp`: a messenger
+  that logs a phone out for being offline past the TTL stranded every
+  long-idle user on `401`, and iOS builds up to 2026-07 answered that
+  `401` by silently registering a fresh UIN. An implementation that
+  enforces `exp` uniformly rediscovers that.
 
 Convention: the token is presented as
 `Authorization: Bearer <jwt>` for every authenticated REST
@@ -438,8 +456,31 @@ the only thing between a disconnected install and a fresh session for the same
 account, so it fails closed: if it cannot be read, the mint is refused rather
 than allowed.
 
-The denylist entry lives 90 days, the same as a linked session token, and its
-clock is refreshed by each further revoke on that account.
+The denylist entry lives 90 days (`DEVICE_TTL_SECONDS`, a compiled-in constant
+on the reference server, and the same clock the linked-device registry and the
+linked-device token of §2.5 run on). The whole per-account set shares one
+expiry, so each further revoke on the account refreshes it for every id already
+in it.
+
+⚠ **The entry expiring is the end of the revoke, not the end of the install.**
+A revoke erases nothing the install holds. Any install still holding the
+account's `signing_key` mints a fresh session by proving it (§2.14), and once
+the entry has aged out that mint succeeds under the same `device_id` as before.
+This is the other half of the sentence above: the denylist is the only thing
+between a disconnected install and a fresh session, and it is a 90-day thing.
+An owner who wants a device out permanently has to rotate what it holds
+(§2.10), which is what actually invalidates its proof, rather than relying on
+the revoke alone.
+
+⚠ **A revoke does not stop push.** Neither call removes the install's rows in
+`device_tokens` (§3.5), so wakes carrying `env`, the sealed envelope of a new
+message, keep going to it until it deletes its own registration or APNs reports
+the token dead (§8.6). Combined with the paragraph in §5.6.3 about the install
+keeping what it already decrypted, this means a revoke stops the account's API
+and socket surface, not delivery to a device that is still holding keys. An
+operator or a client that needs delivery stopped has to call
+`DELETE /users/me/push-token` from that install, which a disconnected install
+has no reason to do.
 
 ⚠ A revoke can only ever be as good as the id it names. A linked session must
 keep presenting the `device_id` it was issued: an install that re-mints under
@@ -471,10 +512,20 @@ What this island is and what it has switched on — read before the client
 offers a feature that an operator may have disabled. Self-hosted islands
 answer with their own values.
 
-Capabilities are additive, and a client reads the keys it knows. An absent key
-defaults PERMISSIVE, so an island that predates a feature still offers it.
-`capabilities.envelope_class` is the one exception and defaults to false: §6.2.4
-says what it promises and why its default runs the other way.
+Capabilities are additive, and a client reads the keys it knows. The default for
+an absent key is per key, not one blanket rule, and the first-party clients
+agree on it:
+
+| Absent key | Reads as | Why |
+|------------|----------|-----|
+| `random_chat`, `reports`, `nearby` (historical), `registration_policy` | permissive (`true` / `"open"`) | An island that predates the flag still runs the feature. Hiding it would remove a surface that works. |
+| `uin_shop`, `hall_of_fame`, `deposit_auth` | `false` | These are surfaces that exist on the flagship and on nothing else. Offering them on an island that never heard of them renders a shop and a wall of fame with no endpoints behind them. |
+| `envelope_class` | `false` | §6.2.4 says what it promises and why its default has to run this way. |
+
+⚠ On iOS `uin_shop` is a hard decode: an answer without the key fails the whole
+capability decode and the client keeps the set it already had, rather than
+falling back to a default. A third implementation should treat the key as
+required in practice and always send it.
 
 ### 2.14 `POST /auth/refresh` (a token without storing one)
 
@@ -1018,15 +1069,33 @@ Response:
 account's **primary** slot (device 1). Additive: an island that predates the
 field omits it and a client reads null.
 
-A starting install compares it with its own identity before it publishes
-anything. Equal, or null, means the primary slot is this install's to write.
-Different means another install of the same account already owns it, and this
-one claims a secondary slot (§5.6.1) instead of overwriting. Overwriting is
-what broke 1:1 delivery for anyone running a phone and a desktop at once: both
-published into slot 1, peers built sessions against whichever wrote last, and
-the other install's messages became undecryptable. The field is the caller's
-own public key, so it discloses nothing they cannot already read out of their
-own bundle.
+A starting install reads `has_bundle` and `signal_identity_key` TOGETHER before
+it publishes anything. Four answers, and they are not three:
+
+| `has_bundle` | `signal_identity_key` | What it means | What the install does |
+|--------------|-----------------------|---------------|-----------------------|
+| `false`      | null                  | Nobody holds the slot. | Publish (§5.1). |
+| `true`       | equal to its own      | The slot is already this install's. | Nothing. It is device 1. |
+| `true`       | some other key        | Another install of the account owns the slot. | Claim a secondary slot (§5.6.1). |
+| `true`       | absent                | The island predates the field. | Leave the slot alone. |
+
+⚠ **The last row is the one to get right.** A null `signal_identity_key` has
+two causes and they call for opposite actions: the account has no libsignal
+material at all, or the island is too old to report what is in the slot.
+`has_bundle` is what separates them, and it predates the field. Reading null as
+"free" on an old island makes the second install of the account call
+`POST /keys/bundle`, which replaces whatever is there (§5.1). Peers then build
+sessions against whichever install wrote last and the other one's messages stop
+opening, which is exactly the 1:1 delivery break this field was added to
+prevent.
+
+An old island also has no device registry to claim a secondary slot in
+(`POST /keys/devices` answers `404` there, §5.6.1), so an install that finds
+that row keeps the material it already has and reaches new peers over v=1,
+which every install of the account can open.
+
+The field is the caller's own public key, so it discloses nothing they cannot
+already read out of their own bundle.
 
 ### 5.5 Key rotation rules
 
@@ -1047,6 +1116,16 @@ own bundle.
 - **One-time prekeys**: each is consumed exactly once. Top up
   via `/keys/prekeys` when count drops.
 
+⚠ All of the above is the PRIMARY slot. A secondary slot (§5.6) has no
+rotation endpoint at all: `POST /keys/devices/{device_id}/prekeys` refills its
+one-time pool and nothing updates its signed prekey, its Kyber prekey or its
+identity, since `POST /keys/bundle` writes the primary slot and
+`POST /keys/devices` mints a NEW slot rather than updating the named one
+(§5.6.1). A secondary therefore keeps the signed prekey it registered with for
+the life of the slot. Retiring the slot and claiming another is the only way to
+replace that material, and it costs a slot number out of the 2..127 range
+permanently (§5.6.3).
+
 ### 5.6 Multi-device (secondary devices)
 
 Everything above is per-UIN with an implicit **primary** device
@@ -1062,8 +1141,9 @@ device 1.
   `device_id IS NULL`, so a phone re-bootstrap never drains a
   secondary's pool and vice versa.
 
-A slot is claimed, listed and retired through §5.6.1 to §5.6.3. The fourth
-endpoint is the per-device bundle fetch:
+A slot is claimed, listed and retired through §5.6.1 to §5.6.3. The two
+remaining endpoints are the per-device prekey replenish (§5.6.5) and the
+per-device bundle fetch:
 
 `GET /keys/{uin}/devices/{device_id}/bundle` — the prekey bundle for
 one device. `device_id = 1` delegates to the legacy
@@ -1095,7 +1175,7 @@ caller's own account. The body is the §5.1 bundle plus two fields:
 | Field               | Type          | Meaning |
 |---------------------|---------------|---------|
 | `sealed_sender_pub` | string, req.  | base64 X25519 public key. Senders encrypt the OUTER sealed-sender envelope for this device to it. The primary device's outer key is the UIN `identity_key` from `/users/{uin}/info`; a secondary holds only its own keys and never the account master key. |
-| `label`             | string / null | free text, shown to the owner in their own device list |
+| `label`             | string / null | free text the owner types. ⚠ Served to ANY authenticated caller through §5.6.2, not only to the owner: a string like `"Web (Chrome)"` is a browser and OS fingerprint the account's contacts can read. Not identity, and not private either. |
 
 ```
 POST /keys/devices
@@ -1192,8 +1272,10 @@ Slot 1 is refused with `400`:
 ```
 
 Slot 1 is the account's primary bundle on the user row, the thing every legacy
-sender encrypts to. Replacing it is a key rotation (§2.10, or a fresh §5.1
-upload), not a slot operation.
+sender encrypts to. Replacing it is a fresh `POST /keys/bundle` upload (§5.1),
+not a slot operation. It is not `POST /auth/reissue` (§2.10): that rotates the
+account's base X25519 and Ed25519 pair and leaves the libsignal material where
+it is. The two sets are independent, as §5.5 and §10.1.2 both record.
 
 Errors: `400 primary_slot`, `404 "no such device"` (unknown, not yours, or
 already revoked), `403 revoke_cooldown` (§5.6.4).
@@ -1203,10 +1285,13 @@ counts revoked rows (§5.6.1), so recycling a number would hand it to a new
 install while a sender's cached roster and any queued copy still point the old
 one at it: ciphertext sealed to the retired install's keys, delivered to an
 install that cannot open it, with no bubble and no error for anyone to report.
-At the moment of revocation the row is reduced to `(uin, device_id,
-revoked_at)` and nothing else. Label, identity, prekey material and the
-recorded lifespan all go, because no read path wants them again and the
-lifespan is the part that says something about the person. The reference server
+At the moment of revocation the row is reduced to the `(uin, device_id)` pair
+plus `revoked_at`. The other columns are blanked in place rather than dropped:
+the label goes to null, the keys to empty strings, the ids to zero. `created_at`
+is NOT NULL and cannot go, so it is folded forward onto the revoke instant,
+which stops the row recording how long the device lived. That lifespan is the
+part that says something about the person; the pair is all the one remaining
+reader (the id allocator of §5.6.1) needs. The reference server
 releases the number itself after 180 days by default
 (`RCQ_DEVICE_REVOKED_MAX_AGE_DAYS`), far past every cache and every queued
 copy.
@@ -1222,7 +1307,30 @@ through the same gate:
   owner kicking out an intruder must never wait;
 - a **linked session** revokes something older than itself only once it has
   survived the cooldown: 24 hours by default, `RCQ_REVOKE_COOLDOWN_SECONDS` on
-  the island.
+  the island;
+- a **linked session** inside its cooldown revoking a target whose birth the
+  island cannot read is refused, same as for an older target.
+
+**How the island tells the two apart, and it is not the `dev` claim.** Every
+install carries one, phones included (§2.9), so the claim proves nothing. The
+discriminator is the linked-device registry: `POST /devices/link` is the only
+writer, and it stamps the row with the `created_at` this gate reads. A caller
+whose `dev` names a row in that registry is a linked session; a caller whose
+`dev` is `"primary"`, is absent, or names nothing in the registry is a native
+install and passes the gate untouched.
+
+**Where the target's age comes from**, since the two revokes act on different
+registries and the ids do not map onto each other (§6.3.1):
+
+| Call | Target | Birth read from |
+|------|--------|-----------------|
+| `DELETE /devices/{id}` | an install id (string) | that row's `created_at` in the linked-device registry; nothing for an id not in it |
+| `POST /keys/devices/{device_id}/revoke` | a key slot (int 2..127) | that slot's `created_at` in the device table (§5.6.1) |
+
+So a young linked session comparing itself against a key slot is comparing two
+timestamps from two different registries, which is exactly what the rule
+intends: it asks whether the thing being removed predates the session removing
+it, whatever kind of thing it is.
 
 Until then, `403`:
 
@@ -1239,6 +1347,31 @@ Read `wait_seconds` rather than assuming 24 hours. A self-hosted island sets
 its own.
 
 A session can always disconnect itself. `DELETE /devices/me` is not gated.
+
+#### 5.6.5 Refilling a slot's pool: `POST /keys/devices/{device_id}/prekeys`
+
+Authenticated, acts on the caller's own account. Same body as the primary
+replenish of §5.2, and `204 No Content` on success:
+
+```
+POST /keys/devices/3/prekeys
+  { "one_time_prekeys": [ { "id": 501, "public": "<base64>" }, ... ] }
+→ 204
+```
+
+Idempotent on `prekey_id`: an id the slot already holds is skipped rather than
+replaced, so a client that retries a lost request does not disturb a key a
+sender may already have fetched.
+
+`404 "no such device"` covers all three failures at once: the slot does not
+exist, it belongs to another account, or it has been revoked. The island does
+not distinguish them, and neither should a client: all three mean stop
+refilling this slot.
+
+The primary pool is NOT reachable here. `device_id = 1` is not a row in the
+device table, so it answers `404`; the primary refills through §5.2. The two
+pools are scoped apart on purpose (§5.6), and a client that confuses them
+drains one while believing it filled the other.
 
 ## 6. Messaging Protocol
 
@@ -1288,9 +1421,9 @@ not enforce the list):
 | `profile`       | Cross-island name/picture refresh (§5e)                         |
 | `contactreq`    | Cross-island contact request (§5f)                              |
 
-The island does not branch on this string. It branches on the 3-value
-storage class it derives from it (§6.1.1), and that class is what decides
-queueing, push and the dormant sweep.
+Queueing, push and the dormant sweep do not branch on this string. They branch
+on the 3-value storage class the island derives from it (§6.1.1). A handful of
+smaller rules do still read the string itself, and §6.1.1 lists them.
 
 **v=1 sealed-sender envelope** (when the recipient has not
 uploaded a libsignal bundle). Layout — opaque to the server,
@@ -1360,8 +1493,11 @@ v=2 envelope: base64( utf8( outer JSON ) )
       "_pad": "<filler, optional; see 6.1.2>" }
 ```
 
-The outer key is the recipient's long-term X25519 identity key, the same one
-v=1 seals to; the libsignal ratchet lives entirely inside `msg`. `kind` tells
+The outer key is the recipient DEVICE's `sealed_sender_pub` from its bundle
+(§5.6.1). For device 1 that key IS the account's long-term X25519 identity key,
+the same one v=1 seals to; for a secondary slot it is that device's own key,
+since a secondary never holds the account master key. The libsignal ratchet
+lives entirely inside `msg`. `kind` tells
 the receiver which libsignal type `msg` holds, and `dev` names WHICH of the
 sender's devices holds the other half of the ratchet, since a ratchet belongs
 to one pair of devices (§5.6). An absent `dev` means device 1, which is what
@@ -1379,32 +1515,65 @@ enforces a version.
 
 #### 6.1.1 Storage class (`cls`)
 
-Since server `2026.08.22.15` the island does not branch on `envelope_type` at
-all. It records a 3-value **storage class** beside it and branches on that. The
-class is what a self-hoster or a second implementation has to get right; the
-type string is an alias that feeds it.
+Since server `2026.08.22.15` the island no longer branches on `envelope_type`
+for the three decisions that decide a message's fate: whether it is QUEUED,
+whether it is PUSHED, and whether the dormant sweep may delete it. It records a
+3-value **storage class** beside the type and branches on that. The class is
+what a self-hoster or a second implementation has to get right; the type string
+is an alias that feeds it.
+
+The type string has not become inert. Five smaller rules still read it:
+
+| Rule | Where |
+|------|-------|
+| `envelope_type: "call"` is an alias for `ring: true` | §6.2.1.1 |
+| a deposit typed `call` is reframed as `message` on the socket frame | §6.2.1.1 |
+| the `owner_only` post gate fires on `message` and lets every other type through | §6.4.4 |
+| a group's slowmode is charged on `message` only, so reactions, reads and edits are never held back | both group endpoints |
+| the one-hour TTL that reaps `sknack` group rows | §6.3.1 |
+
+Only the last is a retention decision, and it is called out again below.
 
 | `cls` | Name      | Kinds that map to it |
 |-------|-----------|----------------------|
 | `0`   | ephemeral | `typing`, `read`, `visit`, `presence`, `nudge`, `bounce` |
-| `1`   | content   | `message`, `reaction`, `edit`, `delete`, `system`, `secscreen`, `gmsg`, `call`, and every kind the island does not recognise |
+| `1`   | content   | `message`, `reaction`, `edit`, `delete`, `system`, `secscreen`, `gmsg`, `call`, `carbon`, `homerec`, `profile`, `contactreq`, and every kind the island does not recognise |
 | `2`   | critical  | `skdm`, `sknack`, and every future key-distribution kind |
 
-The lists are the island's own and cover kinds no shipped client currently
-deposits (`typing` and `presence` ride the socket as events, §7.4.3 and
-§7.4.2). Classifying them costs nothing and means a client that does deposit
-one is filed correctly.
+Only the ephemeral and critical lists are enumerated in the island's code.
+Content is the fall-through, which is why the four types after `call` above are
+on that row: nothing names them, so they land there with every unknown kind.
+
+⚠ **`carbon` and `homerec` land in content, and content pushes.** That is a
+behaviour change nothing in their own descriptions predicts: `homerec` is a
+silent record sync (§6.1) and a `carbon` is the echo of your own send to your
+own devices (§7.4.11), so a user now gets a banner for a note they just typed
+themselves on the other device. §7.4.11 tells a client to type notes to self
+`carbon` rather than `message` precisely to avoid that, and the reason it gives
+stopped holding when the pushable set widened. It is stated here rather than
+fixed here: this document records what the island does.
+
+The lists cover kinds no shipped client currently deposits (`typing` and
+`presence` ride the socket as events, §7.4.3 and §7.4.2). Classifying them
+costs nothing and means a client that does deposit one is filed correctly.
 
 What the class decides:
 
 |                                     | ephemeral (0) | content (1) | critical (2) |
 |-------------------------------------|---------------|-------------|--------------|
-| Queued for an offline recipient     | yes           | yes         | yes          |
+| Queued for an offline recipient, 1:1 | yes          | yes         | yes          |
+| Queued for an offline recipient, group | only if not dormant | only if not dormant, or a wake is going out | yes |
 | Push or wake fired                  | no            | yes         | no           |
 | Exempt from the group dormant sweep | no            | no          | yes          |
 
-**Retention.** All three classes are queued and all three fall under the 30-day
-TTL of §6.3.1. The class neither shortens nor lengthens it.
+The two queueing rows differ because the group queue writes one row per member
+and the 1:1 queue writes one. See the dormant paragraph below, and §6.2.2 for
+what happens when a member is dormant AND has muted the group.
+
+**Retention.** Every row that is written falls under the 30-day TTL of §6.3.1,
+whatever its class. The class neither shortens nor lengthens it. What the class
+does change is whether a GROUP row is written for a given member at all, which
+is the dormant rule below.
 
 **Push.** Content is the pushable class and the only one. Ephemeral kinds are
 delivery-state plumbing or cosmetic pings: never worth waking a phone, and a
@@ -1436,7 +1605,11 @@ kind from a lagging peer is then kept, delivered and pushed rather than
 silently dropped.
 
 The group endpoints (§6.2.2, §6.5) do not take `cls`. They always derive it
-from `envelope_type`, and a `cls` sent there is ignored.
+from `envelope_type`, and a `cls` sent there is ignored. Both DO take
+`envelope_type`: on `POST /messages/group-broadcast` it is optional and
+defaults to `"message"`, it is the only thing the class is derived from there,
+and it never reaches the queue, since a broadcast row is always stored and
+framed as `gmsg` (§6.5).
 
 ⚠ One retention rule still keys on `envelope_type` and not on the class: the
 one-hour TTL that reaps `sknack` group rows (§6.3.1). A client that stops
@@ -1449,8 +1622,11 @@ The wake carries the envelope (§8.1) and the receiving client decides what, if
 anything, to display: the server cannot read the envelope, so it has no basis
 for the distinction it used to draw by kind.
 
-`call` is no longer a class of its own. A call deposit is stored exactly like a
-text message, and the ringing is driven by the `ring` request flag (§6.2.1.1).
+`call` is no longer a class of its own: a legacy `call` deposit is content, and
+it rides the socket framed as `message`, exactly like a text message. The queue
+row still keeps the legible type it was deposited under (§6.2.1.1). Only the
+class and the frame are equalised, not the stored string. The ringing is driven
+by the `ring` request flag, which is never stored at all.
 
 #### 6.1.2 Sealed payload padding (`_pad`)
 
@@ -1472,8 +1648,18 @@ The filler is ASCII `A`, which JSON never escapes, so the padded length is
 exact to the byte. An empty pad key costs exactly 10 bytes (`,"_pad":""`), and
 the sender sizes the filler as `bucket - unpadded - 10`.
 
+⚠ **That 10 assumes compact serialization: no space after the comma, none
+after the colon.** It is what all three clients emit, and it is the number the
+arithmetic above is built on. A serializer that pretties its output by default
+writes `, "_pad": ""` (12 bytes) and lands two bytes past every bucket. Python's
+`json.dumps` is the obvious way to get this wrong; it needs
+`separators=(",", ":")`.
+
 Buckets, shared by all first-party clients: **256, 1024, 4096, 16384, 65536
-bytes**, then multiples of 65536. Coarse on purpose: an observer learns only
+bytes**, then multiples of 65536. The sender picks the smallest bucket that
+holds `unpadded + 10`, which is what keeps the filler from going negative on a
+message that lands just under a rung: such a message is pushed up to the next
+rung rather than left unpadded. Coarse on purpose: an observer learns only
 which rung a message landed on, and an identically sized text lands on the same
 rung whatever composed it.
 
@@ -1551,11 +1737,13 @@ Behaviour:
   client should retry: it means the island's per-mailbox counter drifted,
   and the deposit was rolled back rather than allowed to overwrite a
   queued envelope.
-- If `ring` is set (or `envelope_type` is the legacy `"call"`) and the
-  recipient has no live socket, the ringing wake fires and no message push
-  is sent. Otherwise, if the deposit is content class and any device of the
-  recipient lacks a socket, an APNs or UnifiedPush wake carries the
-  envelope to those devices as `env` (see Section 8).
+- Waking, in this order and no other. If `ring` is set (or `envelope_type` is
+  the legacy `"call"`), the ONLY wake this deposit can produce is the ringing
+  one, and it fires only when the account has no live socket anywhere. A ring
+  deposit never raises a message push, whether the account was online or not
+  (§6.2.1.1). Otherwise, if the deposit is content class and any device of the
+  recipient lacks a socket, an APNs or UnifiedPush wake carries the envelope
+  to those devices as `env` (see Section 8).
 
 Response:
 
@@ -1594,9 +1782,20 @@ otherwise an ordinary content-class row.
   connected device, and the client cannot dedupe a ring against the socket copy
   because it has no call id until it decrypts. Waking while a socket is up
   would ring twice.
-- A ring deposit never also raises a message push.
+- A ring deposit never also raises a message push, in either branch. The
+  island decides on `ring` first and the content-class push is the ELSE of
+  that decision, so a ring to an account that is online produces neither wake.
+  The socket copy is the delivery in that case.
 - The row is queued like any other, so the offline drain still delivers the
   envelope if the wake is late or lost.
+- **One ring per call, and the sender is what guarantees it.** The wake is
+  account-wide: it cannot be aimed at one device and the island does not
+  deduplicate it, so N ring deposits to the same recipient fire N rings. A
+  fan-out (§6.2.3) that set `ring` on every device copy would ring the callee
+  once per copy. The shipped clients never meet this: a call signal is a single
+  v=1 copy sealed to the account identity key, with no `to_device_id` at all,
+  which every install can open. An implementation that fans a call signal out
+  per device must set `ring` on exactly one of the copies.
 - The wake is the same VoIP plus UnifiedPush pair a same-island `call_offer`
   fires (§8.3, §8.7). It carries `kind: "sealed"`, the recipient `to_uin`,
   `envType: "call"`, and the sealed envelope verbatim under `env`. Above 3500
@@ -1618,6 +1817,18 @@ of it. In particular there is no caller nickname in the payload: a same-island
 VoIP wake carries one because that island knows the caller, and this one
 genuinely does not. The client shows a generic incoming call until it decrypts
 the envelope itself.
+
+**And what it discloses to the push provider**, which is a second party and
+easy to forget. The ring travels as a VoIP push through APNs or as a wake to
+the recipient's UnifiedPush distributor, and that payload carries `to_uin` and
+`envType: "call"` in the clear beside the sealed `env` (§8.3). So Apple, or
+whoever runs the distributor, sees which account is being called and that the
+wake is a CALL rather than a message. It does not see the caller, the call id,
+the media type or the SDP, all of which stay sealed. The two plaintext fields
+are there for a reason: a multi-account device holds one token and has to know
+which local account to swap in before it can decrypt anything, and a client
+that cannot tell a call wake from a message wake cannot raise a call screen in
+time. §13.1 has the general shape of what a push provider sees.
 
 The trade was accepted because a censor watching the wire can already infer a
 call from packet timing and size, and a call that does not ring is not a call.
@@ -1685,6 +1896,18 @@ Behaviour:
   dormant member (§6.3.1) is queued only when a wake is going out to them,
   so nobody is notified about a message that was never written down.
   Critical-class rows are queued for every member, dormant or not.
+
+⚠ **Muted plus dormant is silent loss, not a silent banner.** The two rules
+compose in one direction only. Muting the group removes the member from the
+wake set; being dormant removes them from the keep set; the row is written for
+the union of those two sets, so a member who is in neither gets no row at all.
+For a member who is present, muting costs them a banner and nothing else, which
+is what a mute is for. For a member who has been away past
+`OFFLINE_GROUP_DORMANT_DAYS`, muting also costs them the message. Nothing
+signals it: the sender sees `queued: true` (it is true for the group, not for
+that member) and the member sees a group that resumes at their return.
+Key-distribution rows are exempt, since they are critical class and kept for
+everybody.
 
 Response: same `SendOut` shape as 1:1.
 
@@ -1772,12 +1995,13 @@ It is a permanent property of the codebase, not an operator toggle: an island
 either runs a build that knows these fields or it does not. The reference
 server answers `true` from `2026.08.22.15`.
 
-**The rule for a sender.** Every other capability in that object defaults
-PERMISSIVE when absent, so an older island that never heard of a feature still
-shows it. `envelope_class` is the one exception and defaults to **false**. The
-flag was born together with `ring`, so an island that omits it is an island
-that does not know `ring`, and assuming otherwise leaves a cross-island call
-silent on a closed phone.
+**The rule for a sender.** An absent `envelope_class` reads as **false**, never
+as "probably yes" (§2.13 has the per-key defaults). The flag was born together
+with `ring`, so an island that omits it is an island that does not know `ring`,
+and assuming otherwise leaves a cross-island call silent on a closed phone.
+This is the opposite of the permissive default the feature-surface flags take,
+and for the opposite reason: guessing wrong there hides a working surface,
+guessing wrong here breaks a call.
 
 So, when depositing to another island:
 
@@ -2034,8 +2258,17 @@ first:
 | untouched while a sibling cursor of the account is fresher than 7 days | 7 days |
 
 A cursor with no `updated_at` predates the column and is left alone until it
-next acks. The freshest cursor of an account is never a candidate, whatever its
-age, so this can never drop the only cursor an account has.
+next acks.
+
+⚠ **The two rules have different exemptions, and only one of them is safe for a
+lone cursor.** The 7-day leash is computed against the account's freshest
+cursor, so it can never fire on that cursor itself and therefore never drops an
+account's only one. The 30-day rule has no such exemption: it is checked first
+and consults nothing about siblings, so an account whose single cursor has gone
+untouched for 31 days loses it. The next drain from that install finds no
+cursor, and the account watermark is then computed over an empty set, which
+reads as zero. That install is served the whole surviving queue as fresh
+notifications, which is the replay this section exists to prevent.
 
 The shorter leash exists because the two cases are different animals. A phone
 switched off for a fortnight is indistinguishable from a dead install only
@@ -2044,6 +2277,20 @@ moving, the still one belongs to an install that is gone (reinstalled,
 uninstalled, wiped), and holding everybody's sealed envelopes for it is stored
 metadata bought for nobody. The TTL sweep of §6.3.1 backstops cursors abandoned
 without unlinking.
+
+**What happens when a dropped install comes back.** The rules key on the age of
+the cursor and on nothing else: not on a push registration, not on an unlink.
+An install that is merely switched off looks exactly like one that is gone. So
+a phone off for eight days beside a desktop that kept draining loses its
+cursor, and the rows below the surviving minimum cursor are reaped behind it.
+When that phone returns it still holds its install id, finds no cursor, and is
+started at the account watermark, which is now the desktop's position. It is
+served what arrived after that mark. Everything deposited during its absence
+and already drained by the desktop is gone from the island, and there is no
+backfill endpoint to ask for it (§6.3.1). The phone shows no gap and no error:
+the thread simply resumes at its return. This is the cost of the leash, and it
+is the reason 7 days applies only while a sibling is demonstrably alive and 30
+days applies otherwise.
 
 **What a fresh install sees.** It registers or links, gets a token carrying its
 install id, and drains with its own libsignal `dev`. It is served the rows
@@ -2085,9 +2332,15 @@ distinct numbers. `(to_uin, seq)` is unique as the loud backstop: if the
 counter ever drifts, the deposit fails with `503` and the client retries,
 rather than a queued envelope being overwritten.
 
-**How a client uses it.**
+**How a client uses it.** Today: it reads it, stores it, and acts on nothing.
+All three first-party clients capture `seq` beside `id` and use it for no
+decision, which is worth stating plainly so a third implementation does not go
+looking for the rule it is missing. Rows arrive ordered by `received_at`,
+de-duplication is by the inner-content UUID, and the cursor is `id`. `seq` is
+there to let a later revision order or de-duplicate within one mailbox without
+a wire change, and to keep the island's global row id out of that job.
 
-- Read `seq` when present and fall back to `id` when it is null.
+- Read `seq` when present, fall back to `id` when it is null, and store both.
 - The drain cursor and `POST /messages/queue/ack` still work in `id`. `seq` is
   an ordering token, not a cursor.
 - ⚠ **`seq` is gappy, and that is correct.** A message to a recipient with N
@@ -2243,11 +2496,27 @@ Each entry of `members[]`:
 | `all`        | Every member can post. Default.                                        |
 | `owner_only` | Broadcast mode. Only the owner can post; members read + react only. Enables the per-message view-count feature (Telegram-style). |
 
-Server enforcement of `post_policy` is currently client-side:
-the server's group fanout endpoint does not check
-`post_policy` before routing. Closed-broadcast groups rely on
-client behaviour to suppress sends from non-owners. **TODO:
-confirm whether a server-side check is intended.**
+Server enforcement is now real, and it is enforced on the type
+rather than on the endpoint: both group deposit paths reject a
+post to an `owner_only` group from an IDENTIFIED caller who is
+not the owner, with `403 "owner_only: only the group owner may
+post"`. Only `envelope_type: "message"` is gated, so reactions,
+reads, edits and deletes keep flowing from every member and a
+broadcast group stays interactive.
+
+The two paths differ in how strict they are, because they differ
+in whether the caller can hide:
+
+- `POST /messages/group-broadcast` (§6.5) requires a bearer, so
+  the gate is absolute there.
+- `POST /messages/group-sealed` (§6.2.2) is structurally
+  anonymous, and an anonymous post is let through. Every shipped
+  client sends a token for an `owner_only` message send, so this
+  closes the "any member can post through the web client" hole
+  today, and it is left open only so a client that predates the
+  change is not broken. A modified native client that omits the
+  token still gets past it, and the clients re-check the rule on
+  receipt regardless (§6.6).
 
 The view-count endpoints (`/groups/{id}/messages/{mid}/viewed`
 and `/groups/{id}/view-counts`) are gated to broadcast groups
@@ -2303,8 +2572,13 @@ Forward-only: holding `ck_i` gives every later message and no earlier
 one. The chain is rotated (new `kid`, `e+1`) when a member who held it
 leaves, so a removed member cannot read what is posted after they go.
 
-**Distribution.** The chain key travels per-member over the ordinary
-sealed channel as an `skdm` envelope (§6.1), never over the broadcast:
+**Distribution.** The chain key travels per-member, sealed to each member
+individually, never over the broadcast. It is deposited through
+`POST /messages/group-sealed` (§6.2.2) with `envelope_type: "skdm"` and one
+entry per member, NOT through `POST /messages/sealed`. That matters for
+retention: it puts the rows in the group queue, which is the table the
+one-hour `sknack` TTL and the critical-class dormant exemption both act on.
+The envelope inside is:
 
 ```json
 { "kind": "skdm", "gid": 42, "kid": "<b64 16B>", "e": 0,
@@ -2315,8 +2589,12 @@ sealed channel as an `skdm` envelope (§6.1), never over the broadcast:
 mid-conversation gets the chain from the point they joined and not the
 history before it. A member who receives a `gmsg` for a `kid` they do not
 hold answers with `sknack` (`{kind, gid, kid}`) and the sender re-sends
-the `skdm`. A queued `sknack` is reaped after an hour rather than after the queue's
-30 days (§6.3.1); the asking client re-fires while it still needs the key.
+the `skdm`. An `sknack` is deposited the same way an `skdm` is, through
+`POST /messages/group-sealed` with `envelope_type: "sknack"`, fanned to every
+sender-key-capable member because the asking client cannot tell whose `kid` it
+met. A queued `sknack` group row is reaped after an hour rather than after the
+queue's 30 days (§6.3.1); the asking client re-fires while it still needs the
+key.
 
 ⚠ `skdm` and `sknack` are the critical class, exempt from the dormant-queue
 sweep. See §6.1.1: dropping one costs that member the whole group, silently,
@@ -2341,12 +2619,31 @@ strip or swap it without breaking the tag.
 
 ```
 POST /messages/group-broadcast
-  { "group_id": 42, "payload": "<base64 gmsg wire>" }
+  { "group_id": 42, "envelope_type": "message", "payload": "<base64 gmsg wire>" }
 → { "delivered": <int>, "queued": <int>, "server_time": "<iso>" }
 ```
 
-Rate limit 120/min — the same budget as a 1:1 send, because it is now one
-small POST per message whatever the group size.
+`envelope_type` is optional and defaults to `"message"`. It is the DECLARED
+INNER type, and the island reads it for three things only: the storage class
+(§6.1.1), the `owner_only` post gate (§6.4.4) and the group's slowmode, both of
+which fire on `"message"` and let anything else through. It is never stored. The
+queue row and the socket frame are always typed `gmsg`, whatever was declared,
+because that is what tells a receiving client to decode through the chain
+rather than through a sealed-sender opener.
+
+Since `gmsg` is content class, an offline member is woken exactly as they are
+on the per-member path: the same wake, the same `muted_group_ids` gate, and the
+same rule tying the wake set to the keep set for a dormant member (§6.2.2,
+§8.5). Unlike the per-member path, everyone gets the identical envelope, so a
+wake here carries the one ciphertext the whole group shares.
+
+⚠ This endpoint requires authentication, unlike every other deposit path.
+Sealed sender is impossible here by construction: one ciphertext for the group
+means the island must be told which group to fan it to, and `kid` already
+pseudonymises the sender to the island. `401` without a bearer.
+
+Rate limit 120/min (`messages_broadcast`), the same budget as a 1:1 send,
+because it is now one small POST per message whatever the group size.
 
 **Who is skipped.** The island fans out only to members whose client has
 advertised `sender_keys` (§2.12). Everyone else is deliberately left out
@@ -2382,7 +2679,19 @@ URL: `wss://<api-host>/ws/{uin}?token=<jwt>`
 - The path UIN MUST equal the JWT's `sub`. Mismatch → close
   code `4403`.
 - Invalid JWT → close code `4401`.
+- A token whose `dev` claim is on the account's revoke denylist (§2.11.1), or
+  whose `ep` names a previous holder of the number, → close code `4401`. The
+  socket runs the same `authorize_session` check every authenticated REST
+  request runs; before it did, a revoked browser could not call the API and
+  could still sit on a socket receiving messages, presence and call
+  signalling.
 - If the user is `is_suspended = true` → close code `4408`.
+- ⚠ None of these codes reach the client. The refusal happens BEFORE the
+  handshake is accepted, so the peer sees an HTTP `403` and gets no close
+  code at all. They are written down because they are what the island logs
+  and what an accept-then-close implementation would send. `4000`
+  (superseded) is the only code a shipped client acts on, and it arrives on
+  an accepted socket.
 - Otherwise the upgrade succeeds and the worker registers the
   socket in its local `_conns` map AND adds the UIN to the
   cluster-wide `ws:online_uins` Redis set.
@@ -2416,6 +2725,18 @@ which is cluster-wide. False-offline races are possible in the
 multi-device-multi-worker case (one device just disconnected
 on worker A while another stays connected on worker B; the
 SREM races). The worst case is a redundant APNs push.
+
+**Presence is also tracked per install**, in a second cluster-wide set holding
+the install ids of `uin` that currently hold a socket anywhere (one set per
+account, key name hashed, 180s TTL refreshed by every client frame). This is
+what lets the push paths wake the devices that did NOT get the socket copy
+while leaving the connected one alone (§6.2.1): the account-wide answer alone
+meant a desktop left open suppressed the wake for the phone in the user's
+pocket. The install ids here are the same ones the token's `dev` claim carries
+(§2.5), so they line up with the push-token `device_id` of §3.5 and with the
+drain cursor of §6.3.1.2. A push token that recorded no `device_id` cannot be
+placed on either side of that comparison and is skipped whenever anything is
+connected, which is exactly what the account-wide check used to do.
 
 ### 7.3 Heartbeat
 
@@ -2862,9 +3183,17 @@ muting the originating thread inside the app.
 
 ### 8.5 Group muting
 
-`POST /messages/group-sealed` respects `muted_group_ids`: the
-envelope is queued in `OfflineGroupMessage` regardless, but the
-APNs alert is suppressed for muted groups.
+Both group endpoints respect `muted_group_ids`:
+`POST /messages/group-sealed` and `POST /messages/group-broadcast`
+(§6.5) drop a muted member from the wake set before firing anything.
+
+⚠ For a member who has been away past the dormant window, that also
+drops their queue row. The wake set and the keep set are the same
+decision on this path, so muting a group while dormant loses the
+message rather than just the banner. §6.2.2 has the whole rule and
+why it is built that way. For a member who is merely offline, the
+envelope is queued as normal and only the alert is suppressed, which
+is what this section used to say for everyone.
 
 ### 8.6 Token lifecycle
 
@@ -3088,10 +3417,12 @@ across workers. Returns `429 {"code": "cooldown",
 | Contact requests              | yes      |                                        |
 | Offline message queue         | yes      | `OfflineMessage.to_uin`                |
 | Group ownership & membership  | yes      | Both `Group.owner_uin` and `GroupMember.uin` |
-| Audio room ownership / mute   | yes      |                                        |
+| Audio room ownership          | yes      |                                        |
 | Poll creators + voters        | yes      |                                        |
-| Hood banners                  | yes      |                                        |
-| Stories                       | yes      |                                        |
+| Per-mailbox `seq` counter     | yes      | It has to. The re-keyed queue rows keep their old `seq`, so a counter restarting at 1 under the new number would collide with them and `503` the first deposit (§6.3.1.3). |
+| Drain cursors                 | yes      | `QueueCursor.uin`. Also mandatory: the queue moves, and a new number with no cursors has an account watermark of zero, which replays the entire migrated queue as fresh notifications (§6.3.1.2). |
+| Advertised capabilities       | yes      | `sender_keys` (§2.12), so group broadcast keeps reaching them. |
+| Moderation reports            | yes      | Both as reporter and as target: history follows the person, or migrating would launder it. |
 | OwnedUins                     | yes      | Old UIN itself preserved as `OwnedUin(source="migrated")` under the new account |
 
 #### 10.1.2 What does NOT carry over
@@ -3107,6 +3438,22 @@ across workers. Returns `429 {"code": "cooldown",
   valid across the swap.
 - Device push tokens are dropped (the iOS client re-registers
   under the new UIN).
+- **Secondary key slots go with the old row.** `devices` and
+  `one_time_prekeys` carry a cascading foreign key to `users.uin`, so
+  deleting the old user row deletes them. The account arrives at the new
+  number with no device registry and no prekey pools, primary or secondary,
+  and every install re-bootstraps: the first one to publish takes slot 1
+  (§5.4) and the others claim fresh secondaries, with new numbers. A sender
+  holding a cached device roster for the old UIN is holding it for a UIN
+  that no longer exists.
+- **The linked-device registry and its revoke denylist do not move.** Both
+  are Redis state keyed by the old UIN (§2.11.1). Linked sessions are
+  disconnected anyway: their tokens name the old `sub` under an epoch that
+  has just been retired, and the `account_burned` event goes to every socket
+  still open on it. They must be linked again.
+- The signed home-island record is dropped rather than re-keyed: it asserts
+  something about the old number specifically, and the client republishes a
+  fresh one on next boot.
 
 #### 10.1.3 Side effects
 
@@ -3308,9 +3655,31 @@ Limits fail-soft: a Redis outage allows the request through.
 | `groups_join`         | 30          | 3600s    | `POST /groups/{id}/join`              |
 | `messages_send`       | 120         | 60s      | `POST /messages/sealed`               |
 | `messages_group_send` | 60          | 60s      | `POST /messages/group-sealed`         |
+| `messages_broadcast`  | 120         | 60s      | `POST /messages/group-broadcast`      |
 
 Business-feature endpoints carry their own limits, not listed
 here.
+
+⚠ **`messages_send` counts POSTs, and a fan-out is one POST per recipient
+DEVICE** (§6.2.3). Messaging somebody with four installs spends four of the
+120, so the real ceiling is 30 messages a minute to that recipient, and a
+`503` retry on a `seq` collision spends another. A sender that reads 120 as
+"messages per minute" will meet the limiter well before it expects to. The
+budget is per identity, and for the anonymous sealed path the identity is the
+client IP, so several installs behind one relay exit share it.
+
+⚠ **The device-slot endpoints carry no limit of their own.**
+`POST /keys/devices` (§5.6.1), `POST /keys/devices/{device_id}/revoke` (§5.6.3)
+and `POST /keys/devices/{device_id}/prekeys` (§5.6.5) are authenticated and
+otherwise unmetered on the reference island. That matters most for the claim:
+it is not idempotent and the slot range stops at 127, so a client that
+re-registers in a loop burns an account's whole range and gets `409 "device
+limit reached"` for good. Self-hosters should know this; clients should
+persist the id they were handed before anything else can fail.
+
+⚠ The `503` on a `seq` collision (§6.2.1) carries a plain-string `detail`, not
+the structured `{"code": ...}` shape the rest of §12.1 uses. Retry it on the
+status code, not on a code field that is not there.
 
 ## 13. Security Model
 
@@ -3335,12 +3704,24 @@ here.
   backend can drop, delay, or reorder messages, and can hand
   attackers the metadata listed in Section 6.1, but cannot
   produce plaintext.
-- **Push provider (APNs) compromise of message content.** The
-  push payload carries `env` only — a sealed envelope. An
-  attacker with full APNs visibility (Apple or a hypothetical
-  TLS-breaking middlebox) sees only the recipient device's
-  APNs token and the opaque bytes, not the sender, not the
-  body. The NSE decrypts client-side.
+- **Push provider (APNs, or an Android UnifiedPush distributor)
+  compromise of message CONTENT.** The body is inside `env`, a
+  sealed envelope, and the provider cannot open it. The NSE
+  decrypts client-side. The payload is not `env` alone, though,
+  and the plaintext fields around it are worth listing because
+  an operator threat-modelling their island needs them: the
+  recipient `to_uin`, the envelope type (`envType`), the
+  routing hint (`thread-id`, which encodes `peer-<UIN>` or
+  `group-<id>`), the target device (`toDev`) on a fan-out copy,
+  and for a call wake the fact that it IS a call (§8.3). Each
+  is there for a reason a client cannot work around: a
+  multi-account device holds one token and must pick a local
+  account before it can decrypt anything, and a call has to
+  raise a call screen before decryption. So a provider with
+  full visibility learns WHO is being messaged, WHEN, whether
+  it is a call, and which conversation it belongs to. It does
+  not learn the sender or the body. The group NAME used to
+  ride here too and no longer does (§6.2.2).
 - **Active impersonation under the v=1 envelope.** The Ed25519
   signature inside the v=1 sealed envelope is verified against
   the server's published `signing_key`. A server that swaps a
@@ -3414,10 +3795,20 @@ here.
   envelopes because it does not know who sent them. Block
   lists, removed contacts, and per-sender mutes are all
   enforced client-side after decryption. This is a deliberate
-  privacy trade-off; the cost is that spam-suppression must
-  rely on per-recipient delivery tokens (not yet
-  implemented; see TODO at `messages.py:81`) and on
-  client-side filtering.
+  privacy trade-off; the cost is that spam-suppression has to
+  work without knowing the sender. The mechanism for that ships
+  and is off by default: `GET /deposit-auth/params` and
+  `POST /deposit-auth/issue` mint anonymous blinded tokens
+  (RSA blind signatures, gated by proof-of-work), and
+  `POST /messages/sealed` accepts one in an optional
+  `deposit_token` field, verifying and spending it single-use.
+  Issuance is unlinkable to the deposit, so the island can meter
+  senders without identifying them. Both endpoints answer `404`
+  while the island has the feature switched off, which the
+  reference server does, and `capabilities.deposit_auth`
+  (§2.13) is how a client finds out. Until an operator enables
+  it, per-IP limits and client-side filtering are the whole
+  defence.
 - **`read_receipts_visibility` is client-enforced.** The
   server stores the setting and echoes it to the owner but
   does not gate any endpoint based on it. The read-receipt
@@ -3577,7 +3968,7 @@ the change log below.
 | v1.2    | 2026-06-04 | Documented two shipped additive features. New §2.7 Account recovery (opt-in BIP39 seed phrase, `POST /auth/recover/challenge` + `POST /auth/recover` Ed25519 challenge/response; 48-word legacy raw-key export) — corrects the earlier "recovery is not possible" framing. New §5.6 Multi-device (secondary devices: `POST /keys/devices`, `GET /keys/{uin}/devices`, `GET /keys/{uin}/devices/{device_id}/bundle`, per-device OPK pools, `device_id` + `sealed_sender_pub` bundle fields, sender fan-out). No wire-breaking changes. |
 | v1.3    | 2026-06-11 | Economy scrub: removed all remaining inline references to the gamification/economy layer that the 2026-05-27 pivot cut but earlier passes had left dangling in the live sections — jeton media pricing (uploads are now flat-free to the 2 GB safety cap, §9.1/§9.2/§9.5), premium media unlock (§9.7 deleted), paid groups (§6.4 join/invite + the related 402/`paid_group_*` error codes), the `equipped_pet`/`trade_policy`/`reputation`/`reputation_visibility` profile fields + `trades_from_*` push prefs (§3), the jeton-reaction note (§7.4), `trade_received` push gating (§8.4), and the wallet/inventory/trades/marketplace/pets/reputation rows in the migration carryover table (§10.1). Migration is now free. §14.1 already documented the pivot; this aligns the rest of the spec with it. No wire-breaking changes. (Cross-island federation — home-island records, `uin@host`, room-host groups, multihoming — is specified separately in `docs/federation-protocol.md` and is not yet folded into this document.) |
 | v1.4    | 2026-07-31 | Android push documented at last: new §8.7 UnifiedPush (endpoint registration with `platform: "android-up"`, wake payload, mandatory RFC 8030 `TTL`, the retry/prune table and why `507`/`429` from a public ntfy are retryable rather than fatal), `GET /users/me/push-health` and the widened `POST /users/me/push-token` in §3.5, and the offline-queue retention rules in §6.3.1 (30-day TTL plus the 14-day dormant-recipient rule that group rows are subject to and 1:1 rows are not). Documents shipped behaviour; no wire-breaking changes. |
-| v1.6    | 2026-08-04 | Call signalling brought up to what the clients actually send (§7.4.7): the `call_ice_restart` / `call_ice_restart_answer` pair, the encoding of `sdp` (raw text) and of `candidate` (a JSON string whose candidate line is under the key `sdp`) — the two details a third implementation cannot guess and whose absence yields a silent call — multi-device ringing and the `answered_elsewhere` end reason, the enumerated end reasons, and the UnifiedPush call wake alongside the iOS VoIP push. Also corrects §0 and §15.2, which still stamped the document v1.3 (2026-06-11) after the v1.4 and v1.5 revisions. No wire change: all of it documents shipped behaviour. |
-| v1.8    | 2026-08-22 | Three shipped, additive areas the document had no words for. **Device addressing:** `to_device_id` on the sealed deposit and on the queue row, the `dev` query parameter that decides which copies a device is served, the ack rule that advances over the contiguous acked prefix rather than `max(id)` (and the 532 lost group messages that taught it), the per-device drain cursor with its account-watermark floor and its reaping leash (§6.2.3, §6.3.1, §6.3.1.1, §6.3.1.2); §5.6 corrected, since it asserted that no per-device delivery addressing was needed. **Device key slots:** claiming a slot and its non-idempotence, the device list and the `signal_identity_key` that lets a sender check an install without spending a one-time prekey, slot retirement and what it does and does not stop, the shared revoke cooldown and its stolen-link threat model, the session denylist enforced on a token presented AND on a token minted, and the key-slot WS events (§5.4, §5.6.1 to §5.6.4, §2.11.1, §7.4.6). **Stage-2 envelope metadata:** the 3-value storage class `cls` the island now branches on instead of `envelope_type` and what it decides for push and the dormant sweep, the `_pad` filler inside the sealed plaintext and why padding after the AEAD tag makes a message unopenable, the `ring` flag that wakes a socket-less recipient without typing the deposit "call" and exactly what it discloses, `capabilities.envelope_class` and why it is the one capability that defaults false, and the durable per-mailbox `seq` served beside `id` (§6.1.1, §6.1.2, §6.2.1.1, §6.2.4, §6.3.1.3). All of it documents shipped behaviour and all of it is additive: `envelope_type` and `id` are accepted and served forever, an older island ignores the new fields and behaves as it did, and an older client that never sends or reads them is unaffected. No wire break. **Corrections, and they are not small:** the v=1 and v=2 envelope layouts in §6.1 described formats no client has ever sent (a packed binary struct sealed with AES-GCM for v=1, a bare libsignal `SealedSenderMessageContent` for v=2); both are now written from the three shipping clients, which agree byte for byte, and anybody who implemented the old text could not open a single message. §7.1 still said a socket supersedes by UIN, which contradicts per-device delivery and is what used to knock a phone and a browser off each other; it supersedes by (UIN, install). |
-| v1.7    | 2026-08-17 | Reports became a conversation (§14): `GET /reports/mine` now carries `thread` — the whole exchange, oldest first — beside the `reply` older clients read, and `POST /reports/mine/{id}/messages` lets the reporter write back on their own open report (20/hour, 409 `closed` on a resolved one, deliberately not gated on the island's reports-open switch). Documents shipped behaviour; additive, no wire break. |
 | v1.5    | 2026-07-31 | §8.7 gains the embedded distributor the Android client ships since v0.74 (own topic, own push server, resume-from-id on reconnect) and the operator guidance that goes with running one. No wire change: an embedded distributor is indistinguishable from ntfy on the wire. |
+| v1.6    | 2026-08-04 | Call signalling brought up to what the clients actually send (§7.4.7): the `call_ice_restart` / `call_ice_restart_answer` pair, the encoding of `sdp` (raw text) and of `candidate` (a JSON string whose candidate line is under the key `sdp`) — the two details a third implementation cannot guess and whose absence yields a silent call — multi-device ringing and the `answered_elsewhere` end reason, the enumerated end reasons, and the UnifiedPush call wake alongside the iOS VoIP push. Also corrects §0 and §15.2, which still stamped the document v1.3 (2026-06-11) after the v1.4 and v1.5 revisions. No wire change: all of it documents shipped behaviour. |
+| v1.7    | 2026-08-17 | Reports became a conversation (§14): `GET /reports/mine` now carries `thread` — the whole exchange, oldest first — beside the `reply` older clients read, and `POST /reports/mine/{id}/messages` lets the reporter write back on their own open report (20/hour, 409 `closed` on a resolved one, deliberately not gated on the island's reports-open switch). Documents shipped behaviour; additive, no wire break. |
+| v1.8    | 2026-08-22 | Three shipped, additive areas the document had no words for. **Device addressing:** `to_device_id` on the sealed deposit and on the queue row, the `dev` query parameter that decides which copies a device is served, the ack rule that advances over the contiguous acked prefix rather than `max(id)` (and the 532 lost group messages that taught it), the per-device drain cursor with its account-watermark floor and its reaping leash (§6.2.3, §6.3.1, §6.3.1.1, §6.3.1.2); §5.6 corrected, since it asserted that no per-device delivery addressing was needed. **Device key slots:** claiming a slot and its non-idempotence, the device list and the `signal_identity_key` that lets a sender check an install without spending a one-time prekey, slot retirement and what it does and does not stop, the shared revoke cooldown and its stolen-link threat model, the session denylist enforced on a token presented AND on a token minted, and the key-slot WS events (§5.4, §5.6.1 to §5.6.4, §2.11.1, §7.4.6). **Stage-2 envelope metadata:** the 3-value storage class `cls` the island now branches on instead of `envelope_type` and what it decides for push and the dormant sweep, the `_pad` filler inside the sealed plaintext and why padding after the AEAD tag makes a message unopenable, the `ring` flag that wakes a socket-less recipient without typing the deposit "call" and exactly what it discloses, `capabilities.envelope_class` and why its absence has to read as false while the feature-surface capabilities read the other way, and the durable per-mailbox `seq` served beside `id` (§6.1.1, §6.1.2, §6.2.1.1, §6.2.4, §6.3.1.3). All of it documents shipped behaviour and all of it is additive: `envelope_type` and `id` are accepted and served forever, an older island ignores the new fields and behaves as it did, and an older client that never sends or reads them is unaffected. No wire break. **Corrections, and they are not small:** the v=1 and v=2 envelope layouts in §6.1 described formats no client has ever sent (a packed binary struct sealed with AES-GCM for v=1, a bare libsignal `SealedSenderMessageContent` for v=2); both are now written from the three shipping clients, which agree byte for byte, and anybody who implemented the old text could not open a single message. §7.1 still said a socket supersedes by UIN, which contradicts per-device delivery and is what used to knock a phone and a browser off each other; it supersedes by (UIN, install). |
