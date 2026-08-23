@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.8)
+# RCQ Protocol Specification (v1.9)
 
 ## 0. Status & Scope
 
@@ -41,7 +41,7 @@ Out of scope:
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1.8**. Last updated: **2026-08-22**. Spec maintainer:
+Version: **v1.9**. Last updated: **2026-08-23**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 
 ⚠ **Known gaps.** The endpoint census below was taken on 2026-08-16 against
@@ -521,6 +521,7 @@ agree on it:
 | `random_chat`, `reports`, `nearby` (historical), `registration_policy` | permissive (`true` / `"open"`) | An island that predates the flag still runs the feature. Hiding it would remove a surface that works. |
 | `uin_shop`, `hall_of_fame`, `deposit_auth` | `false` | These are surfaces that exist on the flagship and on nothing else. Offering them on an island that never heard of them renders a shop and a wall of fame with no endpoints behind them. |
 | `envelope_class` | `false` | §6.2.4 says what it promises and why its default has to run this way. |
+| `anon_keys`, `group_log`, `vault` (with `vault_max_blob_bytes`, `vault_max_slots`) | `false` | Each says the island runs a stage of the core-metadata plan (anonymous key lookups; one log per room, `/messages/group-log/*`; the vault of §4.9). An island that has not said so is asked the old way, never the new one: a wrong guess there is a silenced room or an unreadable list, not a 404. |
 
 ⚠ On iOS `uin_shop` is a hard decode: an answer without the key fails the whole
 capability decode and the client keeps the set it already had, rather than
@@ -926,6 +927,110 @@ DELETE /contacts/outgoing/{to_uin}     withdraw a request you sent
 
 Withdrawing removes the pending row on both sides; it is not a block and
 leaves no trace for the other person beyond the request disappearing.
+
+### 4.9 The vault: `PUT|GET|DELETE /vault/{slot}`
+
+Stage 4 of the core-metadata plan takes the contact list off the island. What
+survives a reinstall, and what the account's own devices converge on, is the
+vault: a small set of opaque slots per account that hold ciphertext the client
+sealed and a version the island counts. The island holds no key and no schema
+for the contents; it cannot tell a contact list from a room key.
+
+```
+GET    /vault                                                 -> 200 {"slots": [{"slot": "<hex>", "version": <int>}, ...]}
+PUT    /vault/{slot}  {"blob": "<base64>", "version": <int>}  -> 200 {"version": <int>}
+GET    /vault/{slot}                                          -> 200 {"blob": "<base64>", "version": <int>}
+                                                              -> 404 {"detail": {"code": "no_slot", "version": <int>}}
+DELETE /vault/{slot}?version=<int>                            -> 204
+```
+
+`slot` is 32 lower-case hex characters chosen by the client (anything else is
+422). `blob` is base64 of at most `vault_max_blob_bytes` decoded (256 KB on the
+flagship; 413 above that, 400 when it is empty or not base64). An account may
+hold `vault_max_slots` live slots (32; 400 `slot_limit` on the next; an existing
+slot can always be rewritten). Both caps are in §2.13. `GET /vault` lists the
+live slots and their versions, no blobs.
+
+**The version rule.** A write names the version it was based on: the one the
+client read, or 0 only when the island answered that the slot has never
+existed. The island stores the blob as that version plus one, or refuses with
+`409 {"detail": {"code": "stale", "version": <current>}}` and stores nothing.
+There is no path by which a write lands on top of a version its author never
+saw: the refused client re-reads, merges on its own terms and retries. The
+island never compares contents and never merges.
+
+**A version is never reused.** A delete names the version it is based on
+(`version` is required; stale is 409) and leaves a tombstone: the slot reads
+404 with the tombstone's version in the body, and the next write must name
+that version, not 0. Without this a slot deleted and re-created would count
+1, 2, 3 again, and a device that remembered "version 3" from before the delete
+would take the new version 3 for "nothing changed". Deleting what is already
+gone is 204 whatever version it names, so a retried delete cannot fail. A
+never-written slot reads 404 with version 0.
+
+The rule is the lesson of report #605 (2026-08-17), where two devices each
+published their own half of an account-level list and each silently
+un-published the other's, because the island refused only a write with an
+OLDER timestamp and a write carried no notion of what it was based on.
+
+**Sync between the account's devices.** Every accepted write and every delete
+sends `{"type": "vault_changed", "slot": "<hex>", "version": <int>}` to every
+session of the account (§7.4.4), carrying the new version (on a delete, the
+tombstone's). The writer sees its own nudge and ignores it by version; the
+other devices re-read the slot. ⚠ The nudge is pub/sub to live sockets, with
+no queue and no replay: a device whose socket was down at that moment never
+hears it. A client therefore re-reads the slots it uses on every socket
+(re)connect, not only at boot, and `GET /vault` makes that one small request.
+Writes are per merged state, never per entry: importing three hundred
+contacts is one write.
+
+**Derivation (first-party clients).** Slot name and key come from the
+account's long-term X25519 identity private key, not from the recovery seed:
+a browser linked from a phone, a legacy raw-key account and anyone who asked
+the client to forget the phrase have no seed, while every device of an account
+holds `identity_priv` (the link blob of §2.11 carries it, and for a seed
+account it is itself `HKDF(seed)`, §2.7). Same HKDF-SHA256 shape as §2.7, 32
+zero bytes of salt:
+
+```
+slot = hex( HKDF(identity_priv, zeros32, "rcq.vault.slot.v1|" + name, 16) )
+key  =      HKDF(identity_priv, zeros32, "rcq.vault.key.v1|"  + slot, 32)
+blob = 0x01 || nonce(12) || ChaCha20-Poly1305(key, nonce, padded,
+                                 aad = "rcq.vault.v1|" + slot + "|" + version)
+```
+
+`name` is a client-side label (`"contacts"` for the contact list); the island
+sees only the derived hex. `padded` is a 4-byte big-endian length, the
+plaintext, and zero fill to the next 512-byte boundary, so the island learns a
+size class rather than a size. The version in the AAD means the island cannot
+relabel one version as another; it can still serve an older consistent
+(blob, version) pair, which a client detects by refusing any version lower
+than the last one it saw for the slot.
+
+⚠ `POST /auth/reissue` (§2.10) rotates `identity_priv` and with it every slot
+name and key. The island empties the account's vault in the same transaction
+(every slot would be unreachable under the new derivation, and ciphertext
+under a key the user just retired has no business staying). The client that
+rotates reads its slots before the call and writes them back, under the new
+derivation, after it.
+
+**What the island learns.** That an account holds N slots of these size
+classes and when they change. Nothing about the contents; slot names are
+client-derived noise rather than labels. Slots live exactly as long as the
+account: they follow it through §10.1 and go with it in §10.2.
+
+**What the logs hold.** A slot name is a stable per-account pseudonym, so the
+access logs mask `/vault/<hex>` the way they mask `/users/<uin>` (§12).
+
+**Rate limits.** Per account and hour: `vault_list` 600, `vault_get` 1200,
+`vault_put` 240, `vault_delete` 60 (429 with `Retry-After`), plus a 64 MB/day
+byte budget on writes. Capability `vault` in §2.13, absent reads as `false`.
+
+**Status.** Island side live since `2026.08.23.8`. What the clients keep in
+the `contacts` slot, and the staged retirement of §4.1 and §4.2 (the vault
+ships first and empty; clients mirror the server list into it; the server list
+goes read-only; it drops) is the rest of stage 4 and is documented as each
+step ships.
 
 ## 5. Cryptographic Keys & Prekey Publishing
 
@@ -2837,7 +2942,11 @@ Recipient sees:
 { "type": "contact_request",  "request_id": <int>, "from_uin": <int>, "from_nickname": "<string>" }
 { "type": "contact_response", "request_id": <int>, "accepted": <bool>, "to_uin": <int> }
 { "type": "contact_removed",  "peer_uin":   <int> }
+{ "type": "vault_changed",    "slot": "<32 hex>", "version": <int> }
 ```
+
+`vault_changed` goes to every session of the account whose slot moved (the
+new version; on a delete, the tombstone's), never to anyone else; see §4.9.
 
 #### 7.4.5 Group events
 
@@ -3982,3 +4091,4 @@ the change log below.
 | v1.6    | 2026-08-04 | Call signalling brought up to what the clients actually send (§7.4.7): the `call_ice_restart` / `call_ice_restart_answer` pair, the encoding of `sdp` (raw text) and of `candidate` (a JSON string whose candidate line is under the key `sdp`) — the two details a third implementation cannot guess and whose absence yields a silent call — multi-device ringing and the `answered_elsewhere` end reason, the enumerated end reasons, and the UnifiedPush call wake alongside the iOS VoIP push. Also corrects §0 and §15.2, which still stamped the document v1.3 (2026-06-11) after the v1.4 and v1.5 revisions. No wire change: all of it documents shipped behaviour. |
 | v1.7    | 2026-08-17 | Reports became a conversation (§14): `GET /reports/mine` now carries `thread` — the whole exchange, oldest first — beside the `reply` older clients read, and `POST /reports/mine/{id}/messages` lets the reporter write back on their own open report (20/hour, 409 `closed` on a resolved one, deliberately not gated on the island's reports-open switch). Documents shipped behaviour; additive, no wire break. |
 | v1.8    | 2026-08-22 | Three shipped, additive areas the document had no words for. **Device addressing:** `to_device_id` on the sealed deposit and on the queue row, the `dev` query parameter that decides which copies a device is served, the ack rule that advances over the contiguous acked prefix rather than `max(id)` (and the 532 lost group messages that taught it), the per-device drain cursor with its account-watermark floor and its reaping leash (§6.2.3, §6.3.1, §6.3.1.1, §6.3.1.2); §5.6 corrected, since it asserted that no per-device delivery addressing was needed. **Device key slots:** claiming a slot and its non-idempotence, the device list and the `signal_identity_key` that lets a sender check an install without spending a one-time prekey, slot retirement and what it does and does not stop, the shared revoke cooldown and its stolen-link threat model, the session denylist enforced on a token presented AND on a token minted, and the key-slot WS events (§5.4, §5.6.1 to §5.6.4, §2.11.1, §7.4.6). **Stage-2 envelope metadata:** the 3-value storage class `cls` the island now branches on instead of `envelope_type` and what it decides for push and the dormant sweep, the `_pad` filler inside the sealed plaintext and why padding after the AEAD tag makes a message unopenable, the `ring` flag that wakes a socket-less recipient without typing the deposit "call" and exactly what it discloses, `capabilities.envelope_class` and why its absence has to read as false while the feature-surface capabilities read the other way, and the durable per-mailbox `seq` served beside `id` (§6.1.1, §6.1.2, §6.2.1.1, §6.2.4, §6.3.1.3). All of it documents shipped behaviour and all of it is additive: `envelope_type` and `id` are accepted and served forever, an older island ignores the new fields and behaves as it did, and an older client that never sends or reads them is unaffected. No wire break. **Corrections, and they are not small:** the v=1 and v=2 envelope layouts in §6.1 described formats no client has ever sent (a packed binary struct sealed with AES-GCM for v=1, a bare libsignal `SealedSenderMessageContent` for v=2); both are now written from the three shipping clients, which agree byte for byte, and anybody who implemented the old text could not open a single message. §7.1 still said a socket supersedes by UIN, which contradicts per-device delivery and is what used to knock a phone and a browser off each other; it supersedes by (UIN, install). |
+| v1.9    | 2026-08-23 | The vault (§4.9): `PUT|GET|DELETE /vault/{slot}`, opaque client-sealed slots per account with the version rule from report #605 (a write names the version it was based on, 409 otherwise), the `vault_changed` socket nudge (§7.4.4), the first-party derivation of slot name and key from `identity_priv` rather than the seed and why, the padded sealed layout, and the rollback check. Capability `vault` and the two stage flags that were already live but undocumented, `anon_keys` and `group_log`, join the §2.13 table with their shared absent-reads-false rule. Additive; no wire break. |
