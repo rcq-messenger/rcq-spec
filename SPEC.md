@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.9)
+# RCQ Protocol Specification (v1.11)
 
 ## 0. Status & Scope
 
@@ -29,19 +29,21 @@ In scope:
 
 Out of scope:
 
-- Non-messaging APIs (audio rooms, random chat, stories, nearby,
-  hood banners, UIN shop, reports, news, polls, referrals,
-  admin). These ride on the same authentication layer described
-  here, but their endpoints are not part of the messaging
-  protocol. See Section 14 for a one-line index, and Section 14.1
-  for the 2026-05-27 pivot record of what was removed.
+- Non-messaging APIs (audio rooms, random chat, UIN shop,
+  reports, news, admin). These ride on the same authentication
+  layer described here, but their endpoints are not part of the
+  messaging protocol. See Section 14 for a one-line index,
+  Section 14.1 for the 2026-05-27 pivot record, and Section 14.2
+  for what the August 2026 metadata cut deleted outright. Polls,
+  stories, nearby, hood banners and referrals were on this list
+  until then and are gone rather than out of scope.
 - Operational concerns (deployment, monitoring, backups).
 - The libsignal protocol itself. RCQ uses the upstream
   `libsignal` implementation (v0.93+, PQXDH) verbatim for v=2
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1.9**. Last updated: **2026-08-23**. Spec maintainer:
+Version: **v1.11**. Last updated: **2026-08-23**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 
 ⚠ **Known gaps.** The endpoint census below was taken on 2026-08-16 against
@@ -59,8 +61,8 @@ Those six, still undocumented and small: `/deposit-auth/issue`,
 `deposit_token` field they mint for `POST /messages/sealed`; §13.2 says what
 the mechanism is and that the reference island ships it switched off),
 `/gate/check`, `/gate/redeem`, `/link/{token}`, `/health`.
-`/groups/{group_id}/polls` is polls, which section 14 puts out of scope, and it
-is listed here only because its path lives under groups.
+`/groups/{group_id}/polls` was polls. It is neither a gap nor a feature now:
+both poll paths answer `410 Gone` since 2026-08-23, and §14.2 says why.
 
 v1.8 closed one endpoint that shipped after that census
 (`POST /keys/devices/{device_id}/revoke`, §5.6.3) and the field-level gaps a
@@ -142,6 +144,34 @@ via the migration endpoint (Section 10).
 This document treats UINs as opaque integers — the wire format
 does not depend on digit count.
 
+**What counts as taken.** Availability is two tables, not one. An account
+lives in `users`; a number a member is merely HOLDING lives in `owned_uins`
+and has no `users` row at all, which is exactly what holding one means. A
+check that reads only `users` reports somebody's collection as free space, and
+the damage is not recoverable by the holder: their `owned_uins` row now points
+at a stranger's account, and `POST /uin/activate` on it can never work again,
+because migrating onto a UIN that already exists is a 409. Since 2026-08-23
+every path that hands a number to somebody who does not have it asks both
+tables: the random allocator, the invite-reserved number of §2.2, and the
+best-effort `desired_uin` a multihoming client asks for. The one flow that
+must accept a held number, activating a number out of your own collection,
+looks the row up by primary key and checks the owner itself.
+
+The two operator paths ask a third question, a live invite that already
+promises the number: `POST /admin/uin/grant` refuses with `409 {"code":
+"in_use"}`, `409 {"code": "already_held"}` or `409 {"code": "uin_reserved"}`,
+and `POST /admin/invites` refuses with `409 {"code": "uin_taken"}`, `409
+{"code": "uin_held"}` or `409 {"code": "uin_reserved"}`. Both directions
+matter, because a number promised twice fails on the redeemer's side and
+silently.
+
+⚠ The random allocator does NOT consult live invites, only `users` and
+`owned_uins`, so a number an unredeemed invite reserves can still be allocated
+at random. The failure that produces is the same silent one: `/auth/register`
+spends the invite use in the atomic UPDATE BEFORE it tests availability, so a
+redeemer whose reserved number has gone falls through to a random one, the
+single-use code is burnt, and nothing tells them.
+
 ### 2.2 `POST /auth/register`
 
 Creates a new account.
@@ -222,13 +252,36 @@ Behaviour:
 1. Fans out a `{"type": "account_burned"}` WS message to every
    socket currently open for the UIN (so other devices learn
    immediately and can wipe local keys).
-2. Deletes the `User` row. Cascading FKs drop all dependent
-   rows (`device_tokens`, `contacts` rows the user owned,
-   `one_time_prekeys`, etc.). Rows that hold a bare BigInteger
-   reference to the UIN without an FK (e.g. group membership)
-   are deliberately left dangling and
-   garbage-collected by future writes.
-3. Returns `204 No Content`.
+2. Deletes every group the account OWNS, outright, with its
+   membership rows (`group_members.group_id` cascades), and fans
+   a `{"type": "group_deleted", "group_id": <int>, "reason":
+   "owner_burned"}` to each remaining member first. Groups the
+   account was only a member of keep going without it: only that
+   one membership row goes.
+3. Deletes the `User` row. Cascading FKs drop the dependent rows
+   that have one (`device_tokens`, `one_time_prekeys`, `devices`).
+4. Purges every row that references the UIN as a bare BigInteger
+   with no FK, from one shared list (§10.1.1 re-keys the same
+   list). Contacts both ways, contact requests, the offline queue
+   and the group log, drain cursors and the mailbox `seq`,
+   remaining group memberships, audio rooms, advertised
+   capabilities, vault slots, held numbers, and moderation
+   reports as reporter and as target.
+5. Returns `204 No Content`.
+
+⚠ **Correction.** Until v1.10 this section said those FK-less rows were
+"deliberately left dangling and garbage-collected by future writes", and that
+owned groups survived their owner. Neither was ever safe and neither is true:
+a dangling row points at a number the allocator can hand to somebody else, so
+the next holder inherits the queue, the drain watermark and the moderation
+history of the person who left. The purge is a single list shared with
+migration precisely so the two cannot drift apart again.
+
+⚠ Two tables are reached by raw SQL rather than through that list, and only on
+an island old enough to have them: `polls` and `poll_votes` (§14.2). Their
+models are gone, so nothing can name them through the ORM, and a burn that
+skipped them would leave a burned account named in a ballot list. An island
+built from `2026.08.23` on has neither table and the step is a no-op.
 
 There is no soft-delete, undo, or grace period. A burned UIN
 returns to the allocator pool and may be reissued.
@@ -409,6 +462,22 @@ are untouched; peers re-pin on next contact.
 re-handshake. This is not the same operation as §10 migration, which
 changes the number and keeps the keys.
 
+⚠ **It also empties the account's vault**, every slot, in the same
+transaction (§4.9). First-party slot names and keys derive from
+`identity_priv`, so under the new identity nothing could name or open them
+anyway, and ciphertext under a key the user has just retired has no business
+staying. The client that rotates reads its slots BEFORE the call and writes
+them back, under the new derivation, after it.
+
+⚠ **Nothing is announced.** No `vault_changed`, no account event, nothing on
+the socket at all: the account's other devices are told neither that the
+identity moved nor that their slots are gone. They discover it by reading a
+slot name that no longer exists (404, version 0) and cannot tell that apart
+from a slot nobody has written yet. A second device that then writes its own
+cached state creates version 1 of a slot the rotating device is about to
+rewrite from its own copy. This is a known gap rather than a design: the
+rotation is rare and single-device in practice today.
+
 ### 2.11 Linked devices
 
 ```
@@ -518,15 +587,28 @@ agree on it:
 
 | Absent key | Reads as | Why |
 |------------|----------|-----|
-| `random_chat`, `reports`, `nearby` (historical), `registration_policy` | permissive (`true` / `"open"`) | An island that predates the flag still runs the feature. Hiding it would remove a surface that works. |
+| `random_chat`, `reports`, `registration_policy` | permissive (`true` / `"open"`) | An island that predates the flag still runs the feature. Hiding it would remove a surface that works. |
+| `hood`, `stories`, `nearby`, `polls` | permissive (`true`) | Same rule, and for a deleted surface (§14.2) the rule is the trap. All four are on the wire as a permanent `false` rather than dropped, because dropping a key says "this island is old and still runs it". Nearby was dropped for a few hours instead of pinned, and tapping it asked for the location permission FIRST, then 404'd, and told the person their GPS had failed. A removed feature keeps answering `false` for as long as any shipped client still asks. |
 | `uin_shop`, `hall_of_fame`, `deposit_auth` | `false` | These are surfaces that exist on the flagship and on nothing else. Offering them on an island that never heard of them renders a shop and a wall of fame with no endpoints behind them. |
 | `envelope_class` | `false` | §6.2.4 says what it promises and why its default has to run this way. |
 | `anon_keys`, `group_log`, `vault` (with `vault_max_blob_bytes`, `vault_max_slots`) | `false` | Each says the island runs a stage of the core-metadata plan (anonymous key lookups; one log per room, `/messages/group-log/*`; the vault of §4.9). An island that has not said so is asked the old way, never the new one: a wrong guess there is a silenced room or an unreadable list, not a 404. |
+| `media_max_blob_bytes` | "did not say", so the client keeps its own default | NEW in v1.11. An integer, the island's `/media` blob ceiling in bytes (§9.1). Purely informational: nothing about `POST /media/upload` or `PUT /media/{id}` changes, and the island still enforces the cap while reading the body. It exists so a client can refuse an oversize video in the composer rather than at byte 536,870,913 of an upload the person has watched for twenty minutes. Absent, or `0`, is not "no limit" and not "unlimited": it is an island that predates the field, and a client falls back to its own guess (512 MB on Android, which is what every RCQ island has shipped with). |
 
 ⚠ On iOS `uin_shop` is a hard decode: an answer without the key fails the whole
 capability decode and the client keeps the set it already had, rather than
 falling back to a default. A third implementation should treat the key as
 required in practice and always send it.
+
+⚠ `polls` is NEW in v1.10 and `false` from birth, which is not the same
+situation as the other three constants: they already had a key every client
+read, so pinning them hid the surface the same day. Polls never had one, so no
+build in the field can see this, and **no first-party client reads it today or
+is planned to**: the composer was DELETED outright from Android and web on
+2026-08-23 rather than gated on a flag, and there is nothing left for a flag to
+hide. The key is here for a third-party client that still draws a composer and
+for the general rule of §2.13 (a removed surface answers `false` rather than
+going missing), and the `410 Gone` of §14.2 is the whole of the promise to
+everything else, permanently rather than as an interim.
 
 ### 2.14 `POST /auth/refresh` (a token without storing one)
 
@@ -596,7 +678,8 @@ hidden, because senders need it to encrypt):
 | `status`                  | string      | see Section 3.3                      |
 
 Gated by the target's `profile_visibility` setting (default
-`everyone`):
+`everyone`) **AND** by `profile_card_policy` (see §3.1.1): a field
+is served only when BOTH say yes.
 
 | Field            | Type        |
 |------------------|-------------|
@@ -613,15 +696,84 @@ Gated by the target's `profile_visibility` setting (default
 
 Gated separately:
 
-- `last_seen` (datetime|null): governed by `last_seen_visibility`
-  (default `everyone`).
+- `last_seen` (datetime|null): `last_seen_visibility` (default `everyone`)
+  decides it for a viewer who may open the card at all. ⚠ A viewer the card is
+  SHUT to reads `null` whatever `last_seen_visibility` says: §3.1.1 is checked
+  first and it overrides. A contact still reads the timestamp off
+  `GET /contacts`, which answers on its own relationship rule.
+- `avatar_media_id` / `avatar_media_key`: relationship, not a setting. The
+  owner, a contact, or somebody who shares a group with the target. Neither
+  `profile_visibility` nor `profile_card_policy` touches them.
+- `profile_openable` (bool): §3.1.1.
 
 Owner-only echoes (always null for third-party callers, so the
 owner can render the Settings page without an extra fetch):
 
 `last_seen_visibility`, `gender_visibility`, `profile_visibility`,
-`group_invite_policy`, `call_policy`, `read_receipts_visibility`,
-`presence_persistent`, `presence_ttl_minutes`.
+`profile_card_policy`, `group_invite_policy`, `call_policy`,
+`read_receipts_visibility`.
+
+Two more keys are still on this payload and are no longer settings:
+`presence_persistent` is the constant `false` and `presence_ttl_minutes` the
+constant `null`, for every viewer including the owner. See §3.3.
+
+#### 3.1.1 `profile_card_policy` and `profile_openable`
+
+A tri-state (`everyone` / `contacts` / `nobody`, default `everyone`, stored on
+the user and written with `PUT /users/me`) answering a question none of the
+other scopes ask: **may this viewer OPEN my card at all?**
+
+`profile_visibility` blanks the optional FIELDS and still lets the card open,
+on an empty card. This one is about the tap. The complaint behind it: a card is
+reachable from surfaces nobody chose to appear on. React to a message in a
+group and your name lands in the "who reacted" sheet, send a photo and your
+name sits over it in the viewer, join anything and you are a row in a member
+list. Every one of those names is a link.
+
+**The verdict, per viewer, is `profile_openable`** (bool), and it travels on
+every surface that draws a name a client turns into a link:
+
+| Surface | Carries it on |
+|---------|---------------|
+| `GET /users/{uin}/info` | `PublicUser.profile_openable` |
+| `GET /users/search`     | each row |
+| `GET /contacts`         | each `ContactOut`, the exact twin of `callable` |
+| `GET /groups`, `GET /groups/{id}` | each `GroupMemberOut` |
+| audio-room `room_roster` (§7.4.8) | each member entry |
+| `GET /federation/keys/{uin}` (§5.3, unauthenticated) | `PublicKeysOut.profile_openable`, answered at its strictest: a caller from another island is in no contact graph here, so only `everyone` passes |
+
+The rule, given a viewer:
+
+- the owner themselves → always `true`; the setting is about outsiders, the
+  same way `last_seen_visibility` is;
+- `everyone` → `true`;
+- `contacts` → `true` only for an authenticated viewer in the target's contact
+  list;
+- `nobody` → `false`.
+
+**Two halves, and the server half is the one that holds.** `profile_openable`
+tells a well-behaved client not to draw the link. Independently of that, a card
+that may not be opened is SERVED EMPTY: the gate is ANDed into
+`profile_visibility` above, so `first_name`, `city`, `about`, `last_seen` and
+the rest come back null for that viewer. A client that ignores the flag and
+opens the card anyway therefore learns nothing, which is what makes this a
+privacy rule rather than a hint.
+
+⚠ Composition is one-way. The card gate can hide what `profile_visibility`
+would have shown; it can never reveal what `profile_visibility` hides.
+
+⚠ It reads no extra table. `is_contact` is already computed on every one of
+those surfaces for `last_seen`, `gender` and the avatar, and on `/users/search`
+the graph is consulted once per PAGE and only when that page actually contains
+somebody on `contacts`.
+
+⚠ **An island that does not implement this** answers `profile_openable: true`
+everywhere (the field defaults permissive, like the capability flags of §2.13),
+serves every field on `profile_visibility` alone, and drops
+`profile_card_policy` from a `PUT /users/me`, because `ProfileUpdate` ignores
+unknown keys and returns `200` (§3.4). The client's picker will report success
+and the setting will do nothing. A third implementation should treat this
+section as required rather than optional for that reason.
 
 ### 3.2 Visibility scopes
 
@@ -659,14 +811,43 @@ heartbeat (see Section 7) to stay online. Definitions:
   `status`.
 - The stored `status` is consulted only for the sub-state pick
   (`away`/`dnd`/`invisible`) and only when freshness is current.
-- `presence_persistent: true` opts the user OUT of the freshness
-  gate: their chosen `status` is broadcast to watchers even
-  after the WS goes stale.
-- `presence_ttl_minutes` is an optional cap on persistent
-  presence. NULL or 0 means "forever"; a positive value means
-  "show this status for at most N minutes past last_seen, then
-  fall back to offline". Allowed values are 0, 30, 60, 180, 480,
-  1440 (mirrors the iOS picker).
+
+There is no opt-out of the freshness gate. One rule, every account: a fresh
+`last_seen` or offline. Somebody who wants to look offline while connected
+picks `invisible`, which is reduced to `offline` for every other viewer.
+
+**Removed 2026-08-23: "stay visible after leaving"** (`presence_persistent`,
+`presence_ttl_minutes`). The pair opted a user out of the freshness gate, with
+an optional cap in minutes on how long the chosen status kept being broadcast
+after the socket went stale. Both columns are unmapped, both are gone from
+`ProfileUpdate`, and the alarm-clock task that fanned out the expiry went with
+them. It could not do what its own screen promised, and could not have:
+
+- No shipped client ever sent the duration, only the boolean, so the column
+  stayed NULL, and NULL meant FOREVER. Everyone who switched it on got the
+  unbounded version of a setting the UI presented as bounded.
+- Even with a duration, the window was anchored on `last_seen`, which the 25s
+  heartbeat of §7.3 rewrites. The countdown restarted on every ping instead of
+  burning down, so it expired only for somebody who was already offline.
+- It bought no privacy in either direction. `last_seen` is written every 25s
+  for every account regardless, so the island learned nothing less; the only
+  effect was telling the user's contacts they were around when they were not.
+
+⚠ **Both keys stay on the wire, pinned.** `presence_persistent` is a constant
+`false` and `presence_ttl_minutes` a constant `null` in every `PublicUser`,
+for every viewer. Dropping them was tried first and was wrong: the shipped iOS
+Privacy screen seeds its toggle from a local cache and only ever writes that
+cache when the key is PRESENT, so an absent key reads as "keep what I have"
+and the toggle stays ON forever on every phone that had it enabled, with the
+duration picker under it and a countdown still ticking in the contact list. A
+literal `false` is what makes it fall to off. Same rule as the deleted
+capabilities of §2.13: a removed feature has to keep answering, and answer
+"off", for as long as any shipped client still asks.
+
+A `PUT /users/me` that still carries either key is accepted and ignored (the
+model drops unknown keys). Rejecting the body would fail the WHOLE profile
+save, nickname and avatar and every other privacy tri-state travelling in the
+same request, for weeks of field builds, over a dead field.
 
 `POST /presence/status`:
 
@@ -697,17 +878,23 @@ Editable fields: `nickname`, `first_name`, `last_name`, `age`,
 strings; server stores comma-joined), `homepage`, `status_message`.
 
 Editable settings: `last_seen_visibility`, `gender_visibility`,
-`profile_visibility`, `group_invite_policy`, `call_policy`,
-`read_receipts_visibility`, `presence_persistent`,
-`presence_ttl_minutes`.
+`profile_visibility`, `profile_card_policy` (§3.1.1),
+`group_invite_policy`, `call_policy`, `read_receipts_visibility`.
 
 Validation:
 
 - All `*_visibility` and `*_policy` fields must be one of
   `everyone`, `contacts`, `nobody`. Bad value → `400`.
 - `gender` must be one of `male`, `female`, `other`, or null.
-- `presence_ttl_minutes` must be one of `0, 30, 60, 180, 480,
-  1440`.
+- Unknown keys are dropped rather than refused, which is what lets a field
+  build keep PUTting `presence_persistent` (§3.3) and get a 200.
+
+⚠ That last rule cuts the other way for a NEW key, and `profile_card_policy` is
+the case in point: an island that has not implemented it drops it silently and
+answers `200`, so the client's picker reports a saved setting that does not
+exist. There is no way for a client to tell the two apart from the status code
+alone; the honest check is to read `profile_card_policy` back off the owner
+echo of §3.1 and see whether it moved.
 
 Response: a fresh `PublicUser` rendered from the owner's
 viewpoint (so the response includes the owner-only echo fields).
@@ -974,15 +1161,30 @@ un-published the other's, because the island refused only a write with an
 OLDER timestamp and a write carried no notion of what it was based on.
 
 **Sync between the account's devices.** Every accepted write and every delete
-sends `{"type": "vault_changed", "slot": "<hex>", "version": <int>}` to every
-session of the account (§7.4.4), carrying the new version (on a delete, the
-tombstone's). The writer sees its own nudge and ignores it by version; the
-other devices re-read the slot. ⚠ The nudge is pub/sub to live sockets, with
-no queue and no replay: a device whose socket was down at that moment never
-hears it. A client therefore re-reads the slots it uses on every socket
-(re)connect, not only at boot, and `GET /vault` makes that one small request.
-Writes are per merged state, never per entry: importing three hundred
-contacts is one write.
+sends `{"type": "vault_changed", "slot": "<hex>", "version": <int>}` to the
+account's OTHER sessions (§7.4.4), carrying the new version (on a delete, the
+tombstone's). They re-read the slot.
+
+⚠ **The writer is skipped, and it is skipped by install name rather than left
+to recognise its own version.** The nudge is published the instant the write
+commits, while the reply to the `PUT` is still in flight, so the writing device
+regularly hears "slot X is at version 5" BEFORE it learns that it is the one
+that wrote version 5. Comparing against what it last read (4) it then re-reads
+its own write, in the middle of its own read-merge-write loop. Harmless once,
+but it is a second round trip and a second merge on every write, and with more
+than one slot in use there are more writes.
+
+⚠ A session whose token carries no install name is NOT skipped. "Primary" is
+the ABSENCE of a name, not a device (§2.11), so two unnamed installs of one
+account are indistinguishable here and excluding that name would silence the
+real other device. An unnamed writer therefore still hears itself, which is why
+the version comparison stays on the client as well.
+
+⚠ The nudge is pub/sub to live sockets, with no queue and no replay: a device
+whose socket was down at that moment never hears it. A client therefore
+re-reads the slots it uses on every socket (re)connect, not only at boot, and
+`GET /vault` makes that one small request. Writes are per merged state, never
+per entry: importing three hundred contacts is one write.
 
 **Derivation (first-party clients).** Slot name and key come from the
 account's long-term X25519 identity private key, not from the recovery seed:
@@ -999,13 +1201,21 @@ blob = 0x01 || nonce(12) || ChaCha20-Poly1305(key, nonce, padded,
                                  aad = "rcq.vault.v1|" + slot + "|" + version)
 ```
 
-`name` is a client-side label (`"contacts"` for the contact list); the island
-sees only the derived hex. `padded` is a 4-byte big-endian length, the
+`name` is a client-side label (`"contacts"` is the only one in use today); the
+island sees only the derived hex. `padded` is a 4-byte big-endian length, the
 plaintext, and zero fill to the next 512-byte boundary, so the island learns a
 size class rather than a size. The version in the AAD means the island cannot
 relabel one version as another; it can still serve an older consistent
 (blob, version) pair, which a client detects by refusing any version lower
 than the last one it saw for the slot.
+
+**A second slot needs no server change of any kind.** A slot name is 32 hex
+characters and the island attaches no meaning to any of them: no schema, no
+registry, no list of known names. A client that wants a slot beside the contact
+list (chat-list sections, say) derives another name and writes it. The version
+rule above is per (account, slot), so a new slot inherits the whole #605
+discipline the moment it first exists, and the caps of §2.13 are the only
+ceiling.
 
 ⚠ `POST /auth/reissue` (§2.10) rotates `identity_priv` and with it every slot
 name and key. The island empties the account's vault in the same transaction
@@ -1013,6 +1223,12 @@ name and key. The island empties the account's vault in the same transaction
 under a key the user just retired has no business staying). The client that
 rotates reads its slots before the call and writes them back, under the new
 derivation, after it.
+
+⚠⚠ **That deletion is silent.** It removes every slot of the account and sends
+no `vault_changed` and no other event, so the account's other devices are told
+nothing: they learn of it by reading a name that no longer exists, which is a
+404 with version 0 and indistinguishable from a slot never written. A gap, not
+a design (§2.10).
 
 **What the island learns.** That an account holds N slots of these size
 classes and when they change. Nothing about the contents; slot names are
@@ -1797,7 +2013,134 @@ first-party clients pad `text`, `photo`, `video`, `file`, `location`, `edit`,
 `poll` and `carbon`: the kinds whose size tracks what the user wrote or
 attached. Receipts, reactions and signalling are left alone. They are tiny,
 frequent, and their size carries no content, so buying them uniformity would
-spend relay bytes for nothing.
+spend relay bytes for nothing. (`poll` is on that list historically and is
+moot: no client can compose one since 2026-08-23, and the three disagree
+harmlessly about whether to keep the entry: the phones still list it, web
+dropped it. Nothing composes a `poll`, so nothing measures either behaviour on
+the wire. See §14.2.)
+
+#### 6.1.3 Disappearing messages: `ttl` and `ts`
+
+The two fields below live in the APPLICATION envelope, the JSON the clients
+call `envelope_bytes` in §6.1. They are inside the seal, so the island never
+sees either one and enforces neither. They are documented here because a third
+implementation cannot guess them and getting the second one wrong silently
+extends the life of a message its author was told had gone.
+
+```json
+{ "kind": "text", "id": "<UUID>", "text": "...",
+  "ttl": 3600,          // whole SECONDS of life; absent = permanent
+  "ts":  1755950000 }   // sender's epoch SECONDS, only ever beside a ttl
+```
+
+`ttl` is whole seconds and has been declared since the first version of this
+protocol. It is a LOCAL instruction to every device that holds a copy: drop
+this row once that many seconds have passed. Nothing about it is enforceable,
+a peer running a modified client keeps whatever it likes, and it is per side:
+setting one does not reach into the peer's device beyond the `ttl` they choose
+to honour. The first-party pickers offer 60, 300, 3600, 86400 and 604800
+seconds, or off.
+
+**`ts` is new in v1.10 and is the anchor.** The countdown runs from when the
+message was SENT, not from when this device happened to receive it. Without a
+sender time on the wire a receiver can only anchor at receipt, so a phone that
+was offline for a week drains the queue and then keeps a "vanishes in 5
+minutes" message for five minutes MORE, a week after the author was told it was
+gone.
+
+The island does stamp a time, `received_at` on the queue row and `server_time`
+on the socket frame (§6.3.1, §7.4.1), and it is a usable anchor: it is the
+island's clock at DEPOSIT, so for a sender who was online it is close to the
+send time and it survives a late drain. It is not the same thing as `ts`
+though. It sits OUTSIDE the seal, so it is island-supplied rather than
+sender-authenticated; a deposit made from a queue of the sender's own is
+stamped when it finally lands rather than when it was written; and cross-island
+traffic is stamped by the receiving island. `ts` is what the author actually
+claimed, sealed with the message, and a receiver that has it should prefer it.
+
+Rules:
+
+- **Units and name.** Epoch SECONDS, whole, key `ts`. Same name and same units
+  as the `call`, `contactreq` and `profile` envelopes have always used.
+- **Only beside a `ttl`.** A bare timestamp on every message would be a new
+  metadata field inside the ciphertext that buys nothing. A sender that sets no
+  `ttl` sends no `ts`.
+- **Which kinds carry it.** Any content kind that already accepts a `ttl`:
+  today `text`, `photo`, `video`, `file`, `location` and (on the phones, which
+  can compose one) `voice`. Also every one of those nested inside a `carbon`,
+  which is what keeps the copy on the sender's other devices from outliving the
+  copy the timer was set on. Receipts, reactions, edits, deletes and signalling
+  carry neither field. A receiver reads `ts` wherever it reads `ttl`; there is
+  no kind that takes one and not the other.
+- **The deadline** is `ts * 1000 + floor(ttl) * 1000` in milliseconds. A `ttl`
+  that is absent, non-numeric or `<= 0` means the row never expires.
+- **Absent `ts` (an older peer, a third-party client), or a `ts` the rails
+  below refuse.** Fall back, in this order, to whichever the receiver has:
+  1. the ISLAND'S DEPOSIT STAMP for this envelope, `received_at` on the queue
+     row or `server_time` on the socket frame (§6.3.1, §7.4.1), put through the
+     same rails; then
+  2. RECEIPT time, the moment this device took delivery.
+
+  Both are permitted and (1) is preferred, because it is the island's clock at
+  deposit rather than this device's clock at drain: for a sender who was online
+  it is close to the send time and, unlike receipt, it does not move when the
+  drain is a week late. It is not a substitute for `ts`, since it sits OUTSIDE the
+  seal, so it is island-supplied rather than sender-authenticated, and
+  cross-island traffic is stamped by the RECEIVING island. That is why `ts`
+  wins whenever it is there. A receiver with no deposit stamp to hand uses
+  receipt and is conformant. Neither is a reason to refuse the message or to
+  ignore the `ttl`.
+
+⚠ **`ts` is attacker-controlled**, the same as every other field inside an
+envelope somebody else composed, and it moves a deadline. A receiver MUST rail
+it and fall back to receipt time outside the window, which is the honest "we do
+not know":
+
+- Not a finite number, or `<= 0`: reject. This catches a value sent as a
+  string rather than a number, and it catches zero. A value sent as
+  MILLISECONDS is a number and passes here; the future rail below is what
+  catches it.
+- More than 60 seconds in the FUTURE of receipt: reject. A future `ts` extends
+  the life of the message past what the sender claimed, which is the whole
+  attack. 60 seconds of slack absorbs ordinary clock skew.
+- More than 365 days BEFORE receipt: reject. A year is far past any offered
+  TTL, so a value that old is not clock skew, it is milliseconds mistaken for
+  seconds or a hostile "already expired".
+
+A deadline already in the past is NOT rejected. It is the correct outcome for a
+week-old message with a five-minute timer, and the receiver's sweeper is what
+removes it.
+
+**Retries and forwards keep their own terms.** A retry of a send composed ten
+minutes ago must not restart the clock. The sender derives the pair from the
+row it already holds, its stored deadline and its own send time, and ships the
+ORIGINAL `ttl` and the ORIGINAL `ts`, so the deadline lands where it always
+would have rather than granting a fresh full lifetime from now. The same
+derivation is why a row composed before the thread's timer was changed keeps
+the terms it was sent on. A forward is a NEW message: it takes the DESTINATION
+thread's timer with the forward's own send time, not the source thread's, since
+a line forwarded into a room where everything disappears must disappear there
+too.
+
+**Status.** All three first-party clients send `ts` and all three prefer it;
+they differ only in what they fall back to, which is the whole reason the
+fallback is a ladder above rather than one rule:
+
+| Client  | Sends `ts` | Anchors an inbound row on |
+|---------|------------|---------------------------|
+| Web     | yes, since 2026-08-23 | `ts` when it passes the rails (`disappearing.ts` `sendAnchorMs`), otherwise receipt |
+| iOS     | yes, since 2026-08-23 | `ts` when it passes the rails, otherwise the island's `server_time` / `received_at` (`ChatSettingsStore.senderSentAt`) |
+| Android | yes, since 2026-08-23 | `ts`, else the island's deposit stamp, else receipt (`Session.disappearAnchorMs`, rails in `Envelope.saneAnchorMs`) |
+
+The fallback is still specified rather than treated as an error path, because
+an older build of any of them, and any third-party client, sends no `ts` at
+all, and every one of those messages is still a message with a timer on it.
+
+⚠ The consequence of the ladder, stated plainly: for a message from a peer that
+sends no `ts`, drained a week late, a receiver on tier (1) drops it
+immediately while a receiver on tier (2) keeps it for the full TTL more. Both
+are conformant and neither can do better with what it was given. This is an
+argument for sending `ts`, not for picking a tier.
 
 ### 6.2 Sending
 
@@ -2553,8 +2896,10 @@ See Section 7-equivalent endpoints under `/groups/...`:
 - `POST /groups/{id}/members` — invite (any member can invite,
   subject to the group's invite policy).
 - `DELETE /groups/{id}/members/{member_uin}` — kick (admin+) or
-  self-leave. Owner-leave promotes oldest member to owner; if
-  the group is empty after, the group row is deleted.
+  self-leave. Owner-leave promotes a member to owner by the rule
+  in §6.4.2.1, or deletes the group when nobody is eligible.
+- `POST /groups/{id}/transfer-owner`: hand the group to another
+  member, owner only (§6.4.8).
 - `PATCH /groups/{id}` — partial update of group metadata
   (name/description/avatar: admin+; post_policy, is_closed,
   members_hidden: owner only; pinned_text: admin+). (`entry_price`
@@ -2566,6 +2911,46 @@ See Section 7-equivalent endpoints under `/groups/...`:
 Membership cap: a single user may own at most `MAX_GROUPS_PER_USER
 = 5` groups (member-of unlimited).
 
+##### 6.4.2.1 Owner-leave: who inherits the room
+
+The owner leaving is the second of the two ways `owner_uin` moves (§6.4.8 is
+the first, and the only deliberate one). The rule is not "the oldest
+membership row": it is **the oldest membership row whose account still
+exists**, preferring one that is not suspended.
+
+1. Candidates are the group's membership rows JOINED to `users`, in insert
+   order. A row with no `users` row is not a candidate at all.
+2. The oldest candidate with `is_suspended = false` wins.
+3. If every candidate is suspended, the oldest of them wins anyway.
+4. If there are no candidates, **the group row is deleted** and the response is
+   `{"deleted": true}`.
+
+The promoted member's `role` becomes `owner` and their `permissions` is
+CLEARED, exactly as in a transfer (§6.4.8) and for the same reason: an owner's
+powers are implicit, so a moderator cap granted to them earlier would survive a
+later transfer away and leave them holding a seat the next owner never issued.
+Any other row still claiming `role = "owner"` is demoted in the same statement,
+so the one-owner invariant holds through a leave that raced a transfer.
+
+⚠ **"No candidates" is not the same as "no members".** A membership row is a
+bare number with no foreign key (§2.4), so rows survive the burn or migration
+of the account they name. A group whose only remaining rows are such ghosts is
+deleted, not inherited, which is the point: a ghost owner is invisible on
+every roster (`_members_with_users` inner-joins `users`) while every owner-only
+lever 403s for everybody, forever, and an `owner_only` room goes permanently
+silent.
+
+⚠ **No event is fanned for that deletion.** The caller learns it from
+`{"deleted": true}`; no `group_deleted` (§7.4.5) goes anywhere, because by
+construction there is nobody with a live account left to send it to. A ghost
+row's account cannot receive anything.
+
+⚠ A suspended member is a fallback rather than an error here, unlike
+`transfer-owner`, which refuses a suspended target with
+`409 target_suspended`. The two differ because a transfer is a choice that can
+be made again tomorrow, while a leave has to land somewhere: the alternative is
+deleting a room whose members may be back next week.
+
 #### 6.4.3 Group settings
 
 Fields on the `Group` row:
@@ -2574,7 +2959,7 @@ Fields on the `Group` row:
 |----------------------|------------|-------------|------------------|
 | `name`               | string(64) | required    | admin            |
 | `description`        | text       | null        | admin            |
-| `owner_uin`          | int        | creator     | (transfers on owner-leave) |
+| `owner_uin`          | int        | creator     | owner, via `POST /{id}/transfer-owner` (§6.4.8); also moves on owner-leave (§6.4.2.1) |
 | `avatar_seed`        | int        | hash(name)  | (immutable)      |
 | `avatar_media_id`    | string|null| null        | admin            |
 | `avatar_media_key`   | string|null| null        | admin            |
@@ -2665,6 +3050,91 @@ banner exists so the rules / welcome / link-of-the-day are
 visible immediately upon joining. The exception is scoped to
 this single 500-character field. Implementations MUST treat
 the pinned text as group metadata, not user message content.
+
+#### 6.4.8 `POST /groups/{group_id}/transfer-owner`
+
+Hand the group to another member. Owner only, and one way.
+
+```json
+{ "to_uin": <int> }
+```
+
+Response: the full `GroupOut`, same shape as `GET /groups/{id}`, with the new
+`owner_uin` and both roles already changed on the roster.
+
+**Why it exists.** `owner_uin` is the only thing that confers ownership, and
+until now nothing could change it except the owner LEAVING, which promotes by
+the rule of §6.4.2.1: the owner could only hand over by walking out, to
+whichever member with a live account happened to have joined first. The granular caps of §6.6 are not a substitute.
+`members` / `info` / `delete` let a moderator moderate, but every owner-only
+lever (`post_policy`, `is_closed`, `members_hidden`, links and files, slowmode,
+granting caps, deleting the group) reads `owner_uin`, and so do the
+`owner_only` post gate of §6.4.4 and the slowmode exemption. There was no way
+to give those away and no way for the owner to get out from under them.
+
+**What moves.** `Group.owner_uin`, and the `role` on both member rows so the
+roster every client renders matches. Nothing else: no audit row, no "previous
+owner" column. A transfer is one number changing on one row, and a durable
+record of who used to own which room is exactly the metadata this island has
+been shedding.
+
+**The outgoing owner stays, as a plain member, with no caps.** Two halves, both
+deliberate:
+
+- They stay. Dropping them would make "hand this over" also mean "leave", which
+  is a second decision with its own endpoint. Handing over and staying is the
+  ordinary case: the founder of a community stepping back to member.
+- Their `permissions` is cleared rather than back-filled with the full set. The
+  owner's powers were implicit, so there is nothing to preserve, and a cap is a
+  GRANT FROM THE OWNER, who is now somebody else. Leaving the ex-owner holding
+  `members`+`info`+`delete` would be a moderator seat the new owner never
+  issued and might not notice, on a room they were just told they run. One call
+  to §6.6 restores it, made by the person who now has the authority to make it.
+
+The incoming owner's `permissions` is cleared for the same reason it is empty
+on a freshly created group: an owner row carries no explicit caps, or a later
+transfer away would silently leave them holding whatever they had been granted
+before. Any other row still claiming `role = "owner"` is demoted in the same
+statement, so the one-owner invariant is restored on the way through.
+
+**Errors**, all structured so a client can branch:
+
+| Status | Body                                | When |
+|--------|-------------------------------------|------|
+| 403    | `{"code": "owner_only"}`            | caller is not the current owner |
+| 400    | `{"code": "already_owner"}`         | target is the caller |
+| 404    | `{"code": "not_a_member"}`          | target has no membership row in this group |
+| 404    | `{"code": "no_such_user"}`          | target has no account on this island |
+| 409    | `{"code": "target_suspended"}`      | target cannot authenticate at all, so the room would be unmanageable |
+
+Rate limit `groups_transfer_owner`, 10 per hour (§12.2). Rare and one way: the
+ceiling bounds a stolen session rather than pacing a human.
+
+⚠ **Cross-island is refused, not approximated.** Group membership is local by
+construction: a membership row is a bare number that means something only
+against THIS island's accounts, the roster builder drops rows with no local
+user, and nothing on the wire (`owner_uin`, the roster, the preview) carries an
+island for a member. There is no form in which "the owner lives on island B"
+can be expressed, so the explicit account lookup answers `no_such_user` rather
+than leaving a group whose owner is a number this island cannot resolve. The
+same lookup catches the ghost row, a member whose account was burned or
+migrated, which would otherwise hand the room to nobody.
+
+⚠ **The move is conditional on still being the owner**, re-checked at the write
+rather than at the read that opened the request. Two transfers from one owner's
+two devices, or a transfer racing the owner's own leave, both passed the read
+under READ COMMITTED, both wrote `owner_uin`, and both stamped `role: "owner"`
+on their own target: `owner_uin` ended at whichever committed last while the
+other target kept an owner row forever, so the roster badged two owners and one
+of them got 403 from every owner lever. The second writer now matches zero rows
+and is told `owner_only`, which is the truth: somebody else owns the room.
+
+**Announcement.** One `group_membership_changed` on the existing channel
+(§7.4.5), carrying the whole `GroupOut`, which already holds `owner_uin` and
+the roster with both new roles. A client that handles a rename handles this
+with no new code. Above 100 members the event carries the compact form, which
+for this change is not roster-less: `owner_uin` rides it, and §7.4.5 says why
+that field in particular is worth the bytes.
 
 ### 6.5 Sender keys: one ciphertext for the whole group
 
@@ -2875,7 +3345,6 @@ and no flicker is observed. After the window expires:
   receives `call_end` with `reason: "peer_disconnected"`.
 - Any audio-room presence is removed; remaining occupants
   receive `room_member_left`.
-- Hood-Chat bucket presence is removed.
 
 Clients are expected to reconnect on network changes,
 backgrounding cycles, and unexpected close. The iOS client
@@ -2885,9 +3354,12 @@ uses exponential backoff capped at 30s and re-sends `room_enter`
 ### 7.4 Event types
 
 The WS channel is mostly **server-to-client**. The small
-client-to-server set is: `ping`, `typing`, `hood_subscribe`,
-`hood_unsubscribe`, `call_*` (signalling), and the audio-room
-`room_*` events.
+client-to-server set is: `ping`, `typing`, `call_*`
+(signalling), and the audio-room `room_*` events. Any other
+frame from a client falls through and is ignored, neither
+answered nor refused, which is what a build still sending the
+removed `hood_subscribe` / `hood_unsubscribe` now gets
+(§7.4.9).
 
 #### 7.4.1 `message`-family (server → client)
 
@@ -2945,16 +3417,20 @@ Recipient sees:
 { "type": "vault_changed",    "slot": "<32 hex>", "version": <int> }
 ```
 
-`vault_changed` goes to every session of the account whose slot moved (the
-new version; on a delete, the tombstone's), never to anyone else; see §4.9.
+`vault_changed` goes to the OTHER sessions of the account whose slot moved
+(the new version; on a delete, the tombstone's), never to anyone else. The
+writing install is excluded by name, because the nudge is published before the
+reply to its own write; an install whose token carries no name is not excluded,
+since that is the absence of a name rather than a device. See §4.9.
 
 #### 7.4.5 Group events
 
 ```json
 { "type": "group_created",             "group": <GroupOut> }
 { "type": "group_membership_changed",  "group": <GroupOut> }
-{ "type": "group_membership_changed",  "group_id": <int> }
+{ "type": "group_membership_changed",  "group_id": <int>, "owner_uin": <int> }
 { "type": "group_deleted",             "group_id": <int> }
+{ "type": "group_deleted",             "group_id": <int>, "reason": "owner_burned" }
 ```
 
 `GroupOut` shape is the same as the REST `GET /groups/{id}`
@@ -2969,6 +3445,20 @@ on a group of two thousand a single join became gigabytes of fan-out and
 stalled call signalling behind it for tens of seconds. A client that only
 knows the fat form reads `group`, finds nothing, and does nothing — picking
 the change up on its next refresh, which is the intended degradation.
+
+★ **`owner_uin` rides the compact form too**, and it is the one field worth the
+extra bytes:
+
+```json
+{ "type": "group_membership_changed", "group_id": <int>, "owner_uin": <int> }
+```
+
+Every other owner-only lever is enforced by the island, which 403s a stale
+client the moment it uses one. The moderator `delete` cap is not: sealed sender
+leaves the island no sender to check, so a receiving client honours it against
+its own cached roster. A big group that learned about a transfer (§6.4.8) only
+on its next `GET /groups` went on honouring the FORMER owner's deletes,
+cluster-wide, until then.
 
 ⚠ An empty `members[]` in any of these is **not** a statement that the roster
 is empty, and in particular not that the reader was removed from the group.
@@ -3110,10 +3600,13 @@ here for completeness because they share the channel.)
 `room_enter_rejected`. Detailed semantics belong with the
 audio-rooms feature spec — out of scope for this document.
 
-#### 7.4.9 Hood-Chat presence
+#### 7.4.9 Hood-Chat presence (removed)
 
-`hood_subscribe` / `hood_unsubscribe` from client. Server
-broadcasts `hood_count` updates to current bucket viewers.
+`hood_subscribe` / `hood_unsubscribe` and the `hood_count`
+broadcast went with the Hood on 2026-08-22 (§14.2). A client
+still sending either frame is not answered and not refused:
+unknown client frames fall through and are ignored, which is
+the general rule for this channel (§7.4).
 
 #### 7.4.10 Reactions, read receipts, delivery receipts
 
@@ -3412,11 +3905,42 @@ only the ciphertext.
 
 ### 9.1 Size limits
 
-Uploads are flat-free up to a hard safety cap of
-`MAX_BLOB_SIZE = 2 GB` per blob (the per-blob bandwidth/disk
-backstop). There is no paid tier and no per-byte charge — the
-metered-jeton tier was removed in the 2026-05-27 pivot
-(Section 14.1).
+Uploads are flat-free. Each blob is capped at `MAX_BLOB_SIZE`,
+**512 MB by default** (`routers/media.py`, env
+`RCQ_MEDIA_MAX_BLOB_MB`, in whole megabytes, so a self-hosted
+island may set its own). There is no paid tier and no per-byte
+charge; the metered-jeton tier was removed in the 2026-05-27
+pivot (§14.1).
+
+⚠ Corrected in v1.11. Earlier revisions of this section said
+`MAX_BLOB_SIZE = 2 GB`, "the per-blob bandwidth/disk backstop".
+That number is gone from the code, and the shape of the check
+changed with it: the body used to be read whole and measured
+afterwards, so a 2 GB request was a 2 GB allocation, times the
+worker count, on an endpoint that takes no token. The cap is now
+enforced WHILE the body streams to a temp path, a byte over is
+`413` and the partial file is unlinked, and nothing is ever
+renamed under a servable name until the whole body has been read.
+
+Three facts a client needs:
+
+- The cap is on the **encoded blob**, the bytes on the wire, not
+  on the plaintext inside it. For the chunked container of §9.4.2
+  the two differ by the 30-byte header plus 16 bytes per chunk,
+  so a pre-flight check must compute the encoded length rather
+  than compare the file size.
+- Islands advertise the number as
+  `capabilities.media_max_blob_bytes` on `GET /server/info`
+  (§2.13). A client that reads it can refuse in the composer; a
+  client that does not behaves exactly as before.
+- A client is entitled to a SMALLER ceiling of its own, and
+  should have one for downloads. The island's number is what it
+  will ACCEPT, which on a self-hosted island is whatever the
+  operator likes; it is not a promise about what a phone can
+  hold. The Android client bounds a download by the smaller of
+  the two (`min(media_max_blob_bytes, its own 1.5 GB cache
+  cap)`), because a cache eviction pass cannot undo an oversize
+  file it is forbidden to evict.
 
 ### 9.2 `POST /media/upload`
 
@@ -3445,32 +3969,59 @@ Response (`201`):
 
 Returns the raw ciphertext (`application/octet-stream`).
 `404` if the ID is not a valid UUID hex, or the file is
-missing. **There is no auth on download** — anyone holding the
+missing. **There is no auth on download**: anyone holding the
 media_id can fetch the blob. The blob is useless without the
 per-blob AES key, which travels inside the encrypted message
 envelope between sender and recipient(s).
+
+The response is the blob VERBATIM, and since 2026-08-23 the blob
+is one of two containers (§9.4.1). The island does not know which
+and does not branch on it; the reader decides from the leading
+bytes of the response, never from its size and never from who
+sent it (§9.4.6). A `Content-Length` is served, and a reader that
+has one should use it as the declared encoded length when
+checking an RCQM1 header; a reader without one proves the same
+fact at the other end of the stream.
 
 ### 9.4 Key exchange
 
 For each piece of media:
 
-1. Sender generates a fresh AES key (typically AES-256-GCM)
-   client-side.
-2. Sender encrypts the plaintext with that key, producing
-   ciphertext blob.
-3. Sender uploads ciphertext, receives `media_id`.
+1. Sender generates a fresh **32-byte AES-256 key** client-side.
+   One key per blob, never reused, not derived from anything.
+2. Sender seals the plaintext under that key in one of the two
+   containers of §9.4.1, producing the blob.
+3. Sender uploads the blob and receives a `media_id` (§9.2), or
+   chooses the `media_id` itself, a uuid4 hex, and deposits the
+   blob under it with `PUT /media/{media_id}` when the recipient
+   is on another island. That path is first-write-wins and is
+   specified with the rest of federation in
+   `docs/federation-protocol.md`; it takes the same opaque bytes
+   and the same cap as `POST /media/upload`.
 4. Sender constructs the message envelope normally
    (Section 6.1). The inner plaintext includes:
    - `media_id`
-   - the per-blob AES key
-   - MIME type, dimensions, duration, etc.
+   - the per-blob AES key, base64 of the raw 32 bytes
+   - MIME type, dimensions, duration, plaintext size, etc.
 5. Recipient decrypts the envelope, extracts `media_id` + key,
-   fetches `GET /media/{media_id}`, decrypts the blob locally.
+   fetches `GET /media/{media_id}`, and opens the blob locally,
+   choosing the container by the blob's own leading bytes
+   (§9.4.6).
 
 The server therefore knows:
 
-- That a blob of N bytes was uploaded.
-- The blob's UUID.
+- That a blob of N bytes exists under a UUID it either minted or
+  was handed.
+- Whether that blob is an RCQM1 container, and if so its exact
+  plaintext length and chunk size. ⚠ New in v1.11 and easy to
+  miss: the RCQM1 header is in the CLEAR. It is authenticated,
+  because it is the AAD of every chunk (§9.4.4), but it is not
+  confidential, and anyone who can fetch the blob can read it.
+  The monolithic seal already discloses the plaintext length as
+  `size - 28`, so the additional disclosure is the container
+  marker itself, which says "this is media above the sender's
+  large-file threshold". The island does not parse it; it does
+  not have to, the bytes are there for anyone who does.
 
 The server does NOT know:
 
@@ -3479,6 +4030,321 @@ The server does NOT know:
 - Which message it belongs to.
 - Which recipient(s) hold the key.
 - Plaintext bytes.
+
+#### 9.4.1 The two containers
+
+**Monolithic seal.** Everything of ordinary size, and everything
+any client wrote before 2026-08-23.
+
+```
+nonce(12) || ciphertext(N) || tag(16)
+```
+
+AES-256-GCM, 96-bit nonce fresh random per blob, 128-bit tag,
+**no AAD**. This is CryptoKit's `AES.GCM.SealedBox.combined`
+byte for byte, which is why it is what iOS writes and what the
+other clients were built to match. The minimum length is 28 bytes
+(an empty plaintext), which matters for the sniff in §9.4.6.
+
+The whole file sits under one tag, and a GCM tag sits at the END.
+No honest implementation may release a byte of plaintext before
+it has read the last byte and checked that tag; that is what
+"authenticated" means. It also puts a floor under what an open
+costs in memory: the blob, the copy the provider works on, and
+the plaintext, all resident at once. Past roughly a 100 MB clip
+that floor is above what a phone or a browser tab will give one
+process, and the failure is an allocation that never returns,
+which every client rendered as nothing at all (report #691 item
+3, "long videos do not download": no error, no bubble, silence).
+The second container exists for that reason and no other.
+
+**RCQM1, the chunked container.** New 2026-08-23. The plaintext
+is cut into fixed-size chunks and each chunk gets its own
+AES-256-GCM seal under the SAME per-blob key, so sealing and
+opening each cost one chunk of memory whatever the file weighs.
+
+Reference implementations, byte compatible, and the spec follows
+them rather than the other way round:
+`rcq-android/.../crypto/MediaStream.kt` (the origin, and the only
+one that WRITES containers today),
+`RCQ/iOS/.../Services/MediaChunkedBlob.swift`, and
+`RCQ/web-chat/src/lib/media-chunked.ts` with the streaming parse
+in `src/lib/media.ts`.
+
+#### 9.4.2 RCQM1 byte layout
+
+All multi-byte integers are **big-endian**.
+
+```
+header, 30 bytes, in the clear:
+
+  offset  0 : magic        "RCQM1" = 52 43 51 4d 31          5
+  offset  5 : version      0x01                              1
+  offset  6 : chunkSize    uint32 BE, PLAINTEXT bytes/chunk  4
+  offset 10 : chunkCount   uint32 BE                         4
+  offset 14 : plainLen     uint64 BE, total plaintext bytes  8
+  offset 22 : noncePrefix  8 random bytes, fresh per blob    8
+                                                          -- 30
+
+then chunkCount records, back to back, record i =
+
+  ciphertext(len_i) || tag(16)
+
+  len_i = chunkSize for every record but the last
+  last  = plainLen - chunkSize * (chunkCount - 1)
+```
+
+Two quantities are DERIVED, not stored, and every reader
+recomputes them and rejects a header that disagrees:
+
+- `chunkCount = ceil(plainLen / chunkSize)`, and **1 when
+  `plainLen` is 0**. An empty plaintext is one record: zero
+  ciphertext bytes and a tag, 46 bytes of container in total.
+- encoded length `= 30 + plainLen + 16 * chunkCount`. Exact,
+  which is what lets an upload declare a real `Content-Length`
+  instead of falling back to chunked transfer-encoding, and what
+  lets a reader reject a file with bytes appended.
+
+**Writer:** `chunkSize` is 1 MiB (`1 << 20`) on the only client
+that writes containers today. It is 16 bytes of tag per MiB,
+0.0015% overhead, and small enough that decrypting one during a
+seek is imperceptible. A reader must NOT assume it. It is a
+header field, and a reader accepts the range below.
+
+**Reader, before anything has been authenticated.** Every tag
+covers the header, so a lie in it is caught by the first record
+opened. But the header is read first and its numbers drive an
+allocation and a loop BEFORE any tag has been checked, so all
+three clients bound them first, in this order:
+
+1. `plainLen <= 64 GiB`, checked BEFORE any arithmetic runs on
+   it. ⚠ Order matters and the short-circuit is load-bearing: a
+   header claiming 2^63 bytes must be refused here, not inside
+   the multiplication that computes a chunk count from it.
+2. `64 KiB <= chunkSize <= 16 MiB`. A blob claiming a 2 GB chunk
+   size must not make a reader allocate one.
+3. `chunkCount > 0` and `chunkCount == ceil(plainLen /
+   chunkSize)`.
+4. The encoded length equals `30 + plainLen + 16 * chunkCount`.
+   A reader that knows the length in advance (a file on disk, a
+   `Content-Length` it trusts) checks it here. A reader that does
+   not proves the same fact at the far end, by requiring the
+   stream to be EMPTY after the last record.
+
+#### 9.4.3 Per-record nonce and AAD
+
+Each record is AES-256-GCM under the same per-blob key, 128-bit
+tag, and:
+
+```
+nonce(i) = noncePrefix(8) || uint32BE(i)      12 bytes
+AAD(i)   = header(30, exactly as it appears on the wire)
+           || uint32BE(i)                     34 bytes
+```
+
+`i` is the record's index, from 0. The key is fresh random per
+blob AND the prefix is fresh random per blob, so a nonce is never
+reused under a key even in the case where two blobs draw the same
+prefix.
+
+#### 9.4.4 Why the header is in every chunk's AAD
+
+This is the part a third implementation must not simplify. Every
+structural fact about the file lives in the header, and the
+header is in the AAD of every single record. That is what turns a
+pile of individually authenticated pieces into an authenticated
+FILE. One tag failure is the answer to all of:
+
+- **a record moved, or two swapped**: the index bound into the
+  AAD and the nonce no longer matches the position it was read
+  at;
+- **a record duplicated**: the same mismatch, at the second copy;
+- **a record dropped**: a reader walks indices in order, so the
+  next record is checked against the index it EXPECTED, not the
+  one it came from;
+- **the file truncated**: `chunkCount` and `plainLen` are
+  authenticated, and the length check of §9.4.2 fails before a
+  byte is opened; a reader with no declared length runs out of
+  bytes before the count runs out;
+- **the file extended**: the same length check, or the
+  trailing-bytes check after the last record;
+- **the header edited**, `chunkSize` or `plainLen` or the nonce
+  prefix or the version: it IS the AAD, so every tag in the file
+  breaks at once;
+- **a record lifted out of another blob**: the other blob has a
+  different header and a different nonce prefix, and it was
+  sealed under a different key, because the key is fresh per
+  blob.
+
+Stated as the property rather than as a list of attacks: **an
+RCQM1 container opens completely, in order, exactly as it was
+sealed, or a tag fails.** There is no rearrangement of a
+container, and no splice of one container into another, that
+verifies. Android's unit tests assert each line above
+individually (`MediaStreamTest`: swapped, duplicated, truncated,
+edited header, spliced from another blob, a flipped bit anywhere,
+and a source that turned out shorter or longer than the length it
+declared).
+
+What the container does NOT bind is WHICH MESSAGE a blob belongs
+to. `media_id` and the key travel inside the envelope (§9.4), so
+substituting one whole blob for another whole blob is prevented
+by the envelope's seal, not by this format.
+
+#### 9.4.5 The one property chunked AEAD cannot give
+
+**The last record is not verified before the first is used.** A
+consumer that streams starts on record 0, and at that moment it
+has verified record 0 and nothing after it. Every chunked AEAD
+makes this trade (Tink's `StreamingAEAD` and `age` included) and
+it is not fixable inside the format, because releasing early is
+the entire point of it. It must not be claimed away, and it is
+the one sentence about RCQM1 that belongs in any security text
+that mentions the container at all.
+
+Why it bites: a truncated or tampered container plays its
+verified prefix and then stops, and "the video ended" is exactly
+what a short video looks like. An integrity failure presented as
+content is the failure mode to design against. So the clients
+confine early release to one place:
+
+- **Playback is the only streaming consumer, and only on
+  Android.** `MediaStream.ChunkedDataSource` feeds
+  `android.media.MediaDataSource` a record at a time. ⚠ That
+  contract cannot report the failure: it returns a byte count, a
+  short count followed by `-1` is how a stream ENDS, and an
+  exception thrown across the JNI boundary is caught there and
+  turned into the same `-1`. So the reader carries a separate
+  `integrityFailed` flag, and whoever drives the player must ask
+  it before believing a completion. A third implementation that
+  streams needs an equivalent out-of-band channel or it will
+  render tampering as a short clip.
+- **Save, share and export walk the whole container to the end**
+  and publish the output only after every tag has checked out.
+  Android's `MediaStream.streamTo` returns false without
+  finishing on any failure and its callers write to a pending
+  sink; iOS's `MediaChunkedBlob.decrypt` writes to a scratch path
+  and the caller renames it into place only after the call
+  returns. Handing back a truncated file under the name of the
+  whole one is the thing this container was built to make
+  impossible, and a partial file left behind on a throw is
+  deliberate.
+- **iOS and the web/desktop client have no streaming consumer at
+  all.** iOS decrypts the container to a temp file before handing
+  a URL to `AVPlayer`; the web client walks every record, then
+  requires the response stream to be empty, and only then builds
+  the `Blob`. On those two the whole file is verified before
+  anything is played.
+
+The rule to copy: verified-prefix release belongs to PLAYBACK.
+Anything that produces a file the person keeps verifies to the
+end first.
+
+#### 9.4.6 Selection at the sender, detection at the reader
+
+**Selection is by SIZE, at the sender.** The threshold is
+deliberately set ABOVE the point where the monolithic path had
+already stopped working, and that is the whole design of the
+compatibility story.
+
+A container is a blob an older build cannot open, so the switch
+must not land where the alternative is "an older build opens it".
+It lands where the alternative is "nobody opens it, on any
+client, including the sender's own". The shipped threshold is
+**96 MB of PLAINTEXT**, strictly greater
+(`Session.streamThresholdBytes`, so 96 MB exactly is still
+monolithic). That is around 45 seconds of 1080p phone footage, or
+six minutes at 720p. Below the line, nothing about any blob
+changes shape. Above it, the single seal was asking for something
+like 380 MB of transient heap on top of a running app, on a heap
+that is 256 to 512 MB in total.
+
+The same number is the ceiling on the read side of the OLD path:
+a monolithic blob larger than 96 MB is refused with a message
+rather than attempted (Android `legacyInMemoryCeilingBytes`, iOS
+`MediaService.inMemoryPlaintextCeiling`; the web client's own
+ceiling is 256 MB, since a tab's budget is not a phone's). A
+refusal reads as "this did not load", which is survivable and
+honest; an out-of-memory kill takes the whole conversation with
+it.
+
+Two consequences for anyone implementing this:
+
+- **No existing media changes shape.** Photos, avatars, voice
+  notes, documents and ordinary clips keep the byte-identical
+  monolithic layout every shipped client already reads, forever.
+- **A sender is never REQUIRED to write a container.** A client
+  that only ever writes the monolithic seal is a conforming
+  client. It simply cannot send a file past the size at which its
+  own seal stops working.
+
+**Detection is by MAGIC, at the reader.** A reader takes the
+first **6 bytes** of the blob and treats it as RCQM1 if and only
+if they are `52 43 51 4d 31 01`. Anything else, a blob shorter
+than 6 bytes included, is the monolithic seal.
+
+- Six bytes and not thirty, because the monolithic seal can be
+  as short as 28 bytes: a sniff that demanded the whole header
+  could not be performed on a legitimate small blob.
+- The false positive is a monolithic blob whose random 12-byte
+  nonce happens to open with those six bytes: 1 in 2^48 per blob,
+  and that nonce is ours rather than attacker-chosen. (The
+  comment in `MediaStream.kt` says 2^40; the code checks six
+  bytes, so 2^48 is the figure.)
+- ⚠ **A reader must dispatch on the magic, never on the size**,
+  and never on the sender's platform or version. The threshold is
+  sender-side policy that may move, a self-hosted or third-party
+  client may pick a different one, and a size test gets both
+  directions wrong: a 40 MB container from a client with a lower
+  threshold would be opened as a monolithic seal, and a 200 MB
+  monolithic blob from an old build would be parsed as a header.
+  The blob's own bytes are the only thing that is true of the
+  file in hand.
+
+#### 9.4.7 Release order: readers before writers
+
+⚠⚠ **A build that WRITES containers must not reach users before
+the builds that READ them have.** This is operational rather than
+a wire question, and it is the only way this format can hurt
+somebody.
+
+What an older build does with a container it receives: it has no
+notion of a magic, so it does not look for one. It reads the
+**first 12 bytes of the header as a GCM nonce** (`R C Q M 1`, the
+version byte, all four bytes of `chunkSize`, and the first two of
+`chunkCount`), the rest as ciphertext plus tag, and the tag
+fails. There is no "unknown container" branch anywhere for it to
+reach: on Android the open returns null, on iOS nil, on the web
+the catch returns null. All three render a **dead bubble**,
+indistinguishable from a bad key, a corrupt blob or a failed
+download. Nothing retries into success, and the sender was told
+the message was delivered.
+
+The most a client can say in that state is a generic failure, and
+only if it has one wired to this path: on Android that is
+`media_fetch_failed`, "Could not fetch the file. Check the
+connection and try again." It blames the network for a format the
+build cannot parse, and that is the best an older build can do,
+because the fact that would let it say anything better is the
+fact it does not have. A build with nothing wired to the path
+shows nothing at all, and the bubble simply never fills; that is
+what the monolithic out-of-memory failure looked like too, and it
+cost a report and a release to notice.
+
+So the order is: ship the readers, wait until they are in the
+field, then ship the writer. As of 2026-08-23 the first-party
+position is Android reads and writes; iOS and the web/desktop
+client read only, deliberately. Reading has to exist the moment
+anything can send; writing is a separate decision with a
+compatibility cost.
+
+The mirror-image case is already handled and is the shape to
+copy, because it is the same problem in the other direction. A
+monolithic blob too big for the RECEIVER to open is not silence
+either. Android says so in the person's own words
+(`media_video_too_old`): "This video was sent in the old format
+and is too big to open here (%1$d MB). Ask the sender to send it
+again from a newer version."
 
 ### 9.5 `GET /media/usage`
 
@@ -3537,12 +4403,35 @@ across workers. Returns `429 {"code": "cooldown",
 | Offline message queue         | yes      | `OfflineMessage.to_uin`                |
 | Group ownership & membership  | yes      | Both `Group.owner_uin` and `GroupMember.uin` |
 | Audio room ownership          | yes      |                                        |
-| Poll creators + voters        | yes      |                                        |
+| Vault slots                   | yes      | `vault_slots.uin` (§4.9). The slot name and key derive from the identity, not from the number, so the slots stay openable under the new UIN. |
 | Per-mailbox `seq` counter     | yes      | It has to. The re-keyed queue rows keep their old `seq`, so a counter restarting at 1 under the new number would collide with them and `503` the first deposit (§6.3.1.3). |
 | Drain cursors                 | yes      | `QueueCursor.uin`. Also mandatory: the queue moves, and a new number with no cursors has an account watermark of zero, which replays the entire migrated queue as fresh notifications (§6.3.1.2). |
 | Advertised capabilities       | yes      | `sender_keys` (§2.12), so group broadcast keeps reaching them. |
 | Moderation reports            | yes      | Both as reporter and as target: history follows the person, or migrating would launder it. |
-| OwnedUins                     | yes      | Old UIN itself preserved as `OwnedUin(source="migrated")` under the new account |
+| OwnedUins                     | yes      | The whole collection follows its holder, and the old UIN itself is added to it (§10.1.3 item 3) |
+
+⚠ **Correction, v1.10.** This table listed "Poll creators + voters" as
+re-keyed. Polls were removed on 2026-08-23 (§14.2) and their models with them,
+so nothing re-keys those rows and nothing can: the two orphaned tables are
+reachable only by raw SQL now, and only the BURN takes that path (§2.4). A
+migration leaves `polls.creator_uin` and `poll_votes.voter_uin` naming the
+number the account left. That is dead metadata on a dead feature; the burn is
+the promise that has to be kept, and it is.
+
+⚠⚠ **The gap this table does not close: the GROUP is never told.** Group
+ownership and membership are re-keyed above, and that is the whole of it. The
+only socket traffic a migration produces is `account_burned` to the migrating
+account's own sessions (§10.1.3 item 1). No `group_membership_changed` goes to
+any group the account belongs to, so every other member's cached roster keeps
+the OLD number. The consequence is not cosmetic, because §6.4.1 group traffic
+is sealed per recipient and addressed by UIN: a sender working from that cached
+roster deposits a copy addressed to a number that no longer exists, the island
+drops entries whose `to_uin` is not a current member without erroring (it
+cannot error, sealed sender means it does not know who is asking), and the
+migrated user simply never receives it. This lasts until each sender happens to
+refetch the roster. The workaround available today is on the client: re-read
+`GET /groups/{id}` before a group send you care about, and do not cache a
+roster across a session.
 
 #### 10.1.2 What does NOT carry over
 
@@ -3583,9 +4472,51 @@ across workers. Returns `429 {"code": "cooldown",
    reference `users.uin` via a bare BigInteger (no FK) are
    re-keyed manually above.
 3. The old UIN is stamped as `OwnedUin(owner=new_uin,
-   source="migrated", tier=<derived>)` so it doesn't fall back
-   into the allocator pool and so the user can swap back later
-   via a second migration.
+   source="migrated")` so it does not fall back into the
+   allocator pool and so the user can swap back later via a
+   second migration. **This is what the route does since
+   2026-08-23**; before that the stamp lived in the UIN-shop
+   helper, so it applied to `/uin/purchase` and `/uin/activate`
+   only, and the "new number" button in settings, the route
+   people actually press, released the number to the next
+   registration while every client said the number you leave
+   stays yours. Doing it here also closes the window the shop had
+   between two transactions where the number belonged to nobody.
+
+   Two exceptions, in both of which the number goes back into the
+   pool instead:
+
+   - **Somebody else holds it.** An `owned_uins` row for this
+     number naming a different owner is a corrupt state (§2.1
+     says how it used to arise), and this route may not resolve
+     it in its own favour: re-pointing the row would hand the
+     holder's number to whoever happened to be occupying it, with
+     no way back for them. The row is left with its owner, and
+     deleting the old `User` row below is itself the recovery,
+     since it makes the holder's activation work again.
+   - **The collection is already past the cap.** The migration
+     itself is never refused over the cap (this is the one route
+     whose whole value is being available on demand, and the
+     caller is not acquiring anything, they already had this
+     number), but a full collection may go exactly ONE over.
+     Past that the vacated number is released. Without that
+     ceiling the exemption was unbounded: there is no cooldown by
+     default and no rate limit on this route, so a caller could
+     loop it and accumulate numbers, and since availability now
+     rejects anything in anybody's collection (§2.1) each one is
+     permanently out of everyone else's reach.
+
+   ⚠ What the stamp costs, so nobody has to rediscover it: the
+   row IS an old-identity to new-identity mapping with a
+   timestamp, and it lives as long as the number is held. On the
+   shop routes that matches what the user asked for; on THIS
+   route it is new, and this is the route somebody presses to
+   stop being findable. Nothing else on the island answers "which
+   account used to be 100200300": the re-key rewrites rows onto
+   the new number rather than recording the pair, and the UIN
+   epoch counter only counts how many times a number changed
+   hands. The escape is `DELETE /uin/mine/{uin}`, which puts the
+   number back in the pool.
 4. Redis cooldown key for the OLD uin is set with TTL =
    `MIGRATION_COOLDOWN_SECONDS`.
 
@@ -3727,6 +4658,7 @@ Common status codes used by the messaging layer:
 | 403    | Authenticated but not permitted (admin-only / blocked / suspended / closed group) |
 | 404    | Target row not found                                 |
 | 409    | Conflict (already a contact, group cap reached, UIN already registered) |
+| 410    | The feature behind this path was REMOVED (§14.2). Not retryable, and deliberately not a 404: a 404 is indistinguishable from a bad id or a typo. |
 | 413    | Blob too large                                       |
 | 422    | Pydantic validation failure (rare; usually 400)      |
 | 429    | Rate limit exceeded                                  |
@@ -3757,6 +4689,20 @@ Some endpoints return structured error bodies for client UI:
   `{"detail": {"code": "revoke_cooldown", "wait_seconds": <int>}}`
 - `409` linked session renaming itself (§2.11.1):
   `{"detail": {"code": "linked_device_cannot_rename"}}`
+- `410` removed feature (§14.2):
+  `{"detail": {"code": "feature_removed", "feature": "polls"}}`. Same body
+  shape as the operator-disabled `feature_disabled`, so a client that can read
+  one can read the other; the code differs because disabled is a toggle that
+  can come back and removed never does.
+- group ownership transfer (§6.4.8): `403 {"code": "owner_only"}`,
+  `400 {"code": "already_owner"}`, `404 {"code": "not_a_member"}`,
+  `404 {"code": "no_such_user"}`, `409 {"code": "target_suspended"}`
+- number availability (§2.1): `409 {"code": "in_use"}`,
+  `409 {"code": "already_held"}`, `409 {"code": "uin_taken"}`,
+  `409 {"code": "uin_held"}`, `409 {"code": "uin_reserved"}` (operator paths)
+- the vault (§4.9): `409 {"code": "stale", "version": <int>}` on a write or
+  delete that names a version it was not based on, `404 {"code": "no_slot",
+  "version": <int>}` on a slot that is absent or a tombstone
 
 ### 12.2 Rate limits (messaging-layer endpoints)
 
@@ -3772,6 +4718,7 @@ Limits fail-soft: a Redis outage allows the request through.
 | `groups_search`       | 60          | 60s      | `GET /groups/search`                  |
 | `group_preview`       | 120         | 60s      | `GET /groups/{id}/preview`            |
 | `groups_join`         | 30          | 3600s    | `POST /groups/{id}/join`              |
+| `groups_transfer_owner` | 10        | 3600s    | `POST /groups/{id}/transfer-owner`    |
 | `messages_send`       | 120         | 60s      | `POST /messages/sealed`               |
 | `messages_group_send` | 60          | 60s      | `POST /messages/group-sealed`         |
 | `messages_broadcast`  | 120         | 60s      | `POST /messages/group-broadcast`      |
@@ -3973,11 +4920,6 @@ protocol:
 - `/audio_rooms` — multi-party voice rooms (mesh WebRTC,
   signalling through the WS channel)
 - `/random` — anonymous random-chat pairing
-- `/stories` — story feed
-- `/nearby` — opt-in geohash check-in for the "people nearby"
-  surface
-- `/hood/banners` — paid district-banner placements (IAP
-  receipt validation; see Section 14.1)
 - `/uin/quote` + `/uin/purchase` — UIN shop (any free 3-9 digit
   UIN, IAP-priced by length; the purchase endpoint reuses the
   account-migration helper from Section 10)
@@ -4006,11 +4948,13 @@ protocol:
   capability this protocol promises the operator does not
   have. The push that announces an answer carries no part of
   its text
-- `/news`, `/polls`, `/polls/group` — admin-posted feed,
-  global polls, per-group polls
-- `/referrals` — invite-tracking only; no reward attached
+- `/news`: admin-posted feed
 - `/admin` — admin panel (HTTP Basic, separate auth from the
   user JWT)
+
+⚠ `/stories`, `/nearby`, `/hood/banners`, `/referrals` and both poll paths were
+on this list until August 2026 and are not out of scope any more, they are
+gone. See §14.2.
 
 Each uses the JWT bearer from Section 2 and the WS channel
 from Section 7 but has its own dedicated payload contracts.
@@ -4033,24 +4977,105 @@ Paid traffic above the free tier on `/media/upload` was
 also removed in the same pass — uploads are now flat-free
 up to the per-file safety cap.
 
-Two paid surfaces remain, both currently behind a mock
-IAP-receipt shim that accepts any non-empty string as a
-placeholder while StoreKit wiring lands:
+One paid surface remains, behind a mock IAP-receipt shim that
+accepts any non-empty string as a placeholder while StoreKit
+wiring lands:
 
-- **UIN shop** — `POST /uin/quote` returns price + availability
+- **UIN shop**: `POST /uin/quote` returns price + availability
   for a target UIN; `POST /uin/purchase` validates the
   receipt, confirms the UIN is still free, and atomically
   migrates the caller's account onto the new UIN using the
-  helper defined in Section 10.
-- **Hood banners** — `POST /hood/banners` inserts a banner
-  into a geohash-level-6 bucket with a TTL (`1h` / `6h` /
-  `24h` / `7d`). Pricing tiers exposed via
-  `GET /hood/banners/pricing`. Bucket capacity capped at
-  24 active banners; per-UIN create rate limited.
+  helper defined in Section 10. Availability is the two-table
+  rule of §2.1.
 
 Real StoreKit verification will replace the mock-receipt
 gate; the JSON payload field is named `receipt` for
 forward compatibility.
+
+⚠ **Correction, v1.10.** This subsection said two paid surfaces remained. Hood
+banners were the second and were deleted on 2026-08-22 with the rest of the
+hood (§14.2), router, tables and pricing endpoint together.
+
+### 14.2 Removed August 2026 (core-metadata cut)
+
+The 2026-05-27 pivot above cut features for product reasons. This pass cut
+them for metadata reasons: each one wrote down, in the clear, something the
+rest of this document promises the island does not learn.
+
+**2026-08-22.** Hood (the geohash district chat and the paid banners),
+stories and their view log, people nearby, referrals in both directions, the
+per-group per-message view counts, and audio-room mutes. Routers, tables and
+operator settings keys all. `hood`, `stories` and `nearby` remain on
+`GET /server/info` as a permanent `false` (§2.13).
+
+**2026-08-23: polls.** `POST /groups/{group_id}/polls` and everything under
+`/polls` (`/{poll_id}`, `/{poll_id}/vote`, `/{poll_id}/close`,
+`/by_message/{message_id}`) answer:
+
+```
+410 Gone
+{ "detail": { "code": "feature_removed", "feature": "polls" } }
+```
+
+Why they went. A poll was only half end to end encrypted. The question and the
+option labels rode the encrypted `poll` chat envelope and the island never saw
+them, but `poll_votes` held `(poll_id, voter_uin, option_index, created_at)` in
+the clear for EVERY poll, the ones marked anonymous included: anonymity was a
+filter in the response builder, never a property of the stored row. And
+`polls.creator_uin` sat beside `polls.message_id`, the UUID of the encrypted
+group envelope that announced the poll, so for that one message the island
+learned the author by name. That is sealed sender defeated by a side table.
+
+Why `410` and not a deleted route. `polls` was never a key in
+`GET /server/info`, so no build in the field can be told the feature is gone by
+any means other than calling. A routing 404 is indistinguishable from "no such
+poll id" and from a typo in the path; People Nearby was cut that way and the
+result was worse than a dead button (§2.13). Gone is the one status that says
+"this path was real and is not coming back". The tombstone is one catch-all
+rather than four stubs, so a path missed in the list cannot still fall through
+to a 404, and it is hidden from the OpenAPI schema. It is deliberately
+unauthenticated: a `401` first would send a client with an expired token off to
+refresh it for a feature that no longer exists.
+
+What a shipped client does with the answer, which is why `410` is enough. On
+iOS the refresh and by-message lookups swallow the error, so the bubble draws
+its question, every option and a zero next to each, with no bars and no "you
+voted" marks: a poll whose results are no longer counted, which is what it is.
+Voting and closing surface the existing error string, and creating one fails at
+the Create button rather than half-succeeding into an untallyable envelope.
+⚠ Android 0.146 is worse and nothing server-side can improve it: the composer
+closes BEFORE the send and the call is wrapped with no failure branch, so the
+410 is swallowed whole (dialog dismisses, no bubble, no toast). The good half
+still holds, the envelope fan-out is never reached, so there is no orphan
+bubble. That is the case the new `polls` capability exists for, and it starts
+helping one client release from now.
+
+**The tables are still there, on purpose, and dropping them is work still
+owed.** `polls` and `poll_votes` lost their models, so `create_all` stops
+building them and an island created from this release on never has them; an
+island that already does keeps its rows. A drop from a list in code runs on a
+RESTART, before anybody has looked at anything, and cannot be undone, and this
+release is the first moment anybody learns polls are gone. Until the drop runs,
+`poll_votes` holds the full ballot list of every poll ever created on that
+island, the anonymous ones included. Run it once the request metrics for both
+paths have sat at zero long enough to believe the field has updated:
+
+```sql
+DROP TABLE IF EXISTS poll_votes;
+DROP TABLE IF EXISTS polls;
+```
+
+Children first: `poll_votes.poll_id` still carries its physical FK. On Postgres
+`DROP TABLE IF EXISTS polls CASCADE;` alone does both, and the two-statement
+form is the one a SQLite self-hoster can also run.
+
+⚠ Erasure could not wait for that. Losing the models also lost both tables from
+the shared per-UIN list (§2.4, §10.1.1), so `DELETE /auth/account` would have
+left a burned account named in `poll_votes.voter_uin` and `polls.creator_uin`.
+The burn reaches them by raw SQL instead, against whichever of the two the
+island turns out to have, decided once at boot rather than discovered inside
+somebody's burn. Migration deliberately does not follow: it leaves those rows
+naming the number the account left (§10.1.1).
 
 ## 15. Spec Maintenance
 
@@ -4072,11 +5097,24 @@ implementation already does) may go straight to PR.
 
 ### 15.2 Versioning
 
-This document is **v1.8**. The protocol wire major is still v1;
+This document is **v1.11**. The protocol wire major is still v1;
 the `.x` suffix tracks doc revisions. Wire-breaking changes would
 bump the major. Additive endpoints, new optional fields, and new
 envelope types do not require a major bump; they are recorded in
 the change log below.
+
+⚠ A revision is not only for additions. Removing a feature, changing what a
+path answers, and pinning a field to a constant are all recorded here too, and
+none of them is a major bump as long as an old client keeps working: it is the
+WIRE that is versioned, not the feature list. v1.10 is the first revision made
+mostly of removals, and it is a `.x` for exactly that reason.
+
+⚠ v1.11 documents a new BLOB container and is still not a major bump, because
+the server is not involved: `/media` stores opaque bytes and branches on
+nothing, and a client that never writes one is unaffected forever. But it is
+the first thing in this document whose compatibility risk is a RELEASE ORDER
+rather than a field (§9.4.7), and a spec version cannot enforce that. Read
+§9.4.7 before shipping a writer.
 
 ### 15.3 Version history
 
@@ -4092,3 +5130,5 @@ the change log below.
 | v1.7    | 2026-08-17 | Reports became a conversation (§14): `GET /reports/mine` now carries `thread` — the whole exchange, oldest first — beside the `reply` older clients read, and `POST /reports/mine/{id}/messages` lets the reporter write back on their own open report (20/hour, 409 `closed` on a resolved one, deliberately not gated on the island's reports-open switch). Documents shipped behaviour; additive, no wire break. |
 | v1.8    | 2026-08-22 | Three shipped, additive areas the document had no words for. **Device addressing:** `to_device_id` on the sealed deposit and on the queue row, the `dev` query parameter that decides which copies a device is served, the ack rule that advances over the contiguous acked prefix rather than `max(id)` (and the 532 lost group messages that taught it), the per-device drain cursor with its account-watermark floor and its reaping leash (§6.2.3, §6.3.1, §6.3.1.1, §6.3.1.2); §5.6 corrected, since it asserted that no per-device delivery addressing was needed. **Device key slots:** claiming a slot and its non-idempotence, the device list and the `signal_identity_key` that lets a sender check an install without spending a one-time prekey, slot retirement and what it does and does not stop, the shared revoke cooldown and its stolen-link threat model, the session denylist enforced on a token presented AND on a token minted, and the key-slot WS events (§5.4, §5.6.1 to §5.6.4, §2.11.1, §7.4.6). **Stage-2 envelope metadata:** the 3-value storage class `cls` the island now branches on instead of `envelope_type` and what it decides for push and the dormant sweep, the `_pad` filler inside the sealed plaintext and why padding after the AEAD tag makes a message unopenable, the `ring` flag that wakes a socket-less recipient without typing the deposit "call" and exactly what it discloses, `capabilities.envelope_class` and why its absence has to read as false while the feature-surface capabilities read the other way, and the durable per-mailbox `seq` served beside `id` (§6.1.1, §6.1.2, §6.2.1.1, §6.2.4, §6.3.1.3). All of it documents shipped behaviour and all of it is additive: `envelope_type` and `id` are accepted and served forever, an older island ignores the new fields and behaves as it did, and an older client that never sends or reads them is unaffected. No wire break. **Corrections, and they are not small:** the v=1 and v=2 envelope layouts in §6.1 described formats no client has ever sent (a packed binary struct sealed with AES-GCM for v=1, a bare libsignal `SealedSenderMessageContent` for v=2); both are now written from the three shipping clients, which agree byte for byte, and anybody who implemented the old text could not open a single message. §7.1 still said a socket supersedes by UIN, which contradicts per-device delivery and is what used to knock a phone and a browser off each other; it supersedes by (UIN, install). |
 | v1.9    | 2026-08-23 | The vault (§4.9): `PUT|GET|DELETE /vault/{slot}`, opaque client-sealed slots per account with the version rule from report #605 (a write names the version it was based on, 409 otherwise), the `vault_changed` socket nudge (§7.4.4), the first-party derivation of slot name and key from `identity_priv` rather than the seed and why, the padded sealed layout, and the rollback check. Capability `vault` and the two stage flags that were already live but undocumented, `anon_keys` and `group_log`, join the §2.13 table with their shared absent-reads-false rule. Additive; no wire break. |
+| v1.10   | 2026-08-23 | Five protocol changes and a correction pass. Nothing here breaks the wire for an old client: every removed surface still answers, every addition is optional, and an island that has not shipped this behaves as it did. Several of them change what the island ANSWERS, which is why this is a revision rather than an editorial fix. **Presence after leaving is gone** (§3.3, §3.1, §3.4): `presence_persistent` and `presence_ttl_minutes` are unmapped, out of `ProfileUpdate`, out of the validation, and the per-user expiry timer that fanned out the delayed offline went with them. Presence is one rule for every account now, fresh `last_seen` or offline, with no opt-out; somebody who wants to look offline while connected picks `invisible`. The setting could not do what its own screen promised: no shipped client ever sent the duration, only the boolean, so the column stayed NULL and NULL meant FOREVER, and even with a duration the window was anchored on `last_seen`, which the 25s heartbeat rewrites, so the countdown restarted on every ping instead of burning down. Both keys stay on the wire, pinned to `false` and `null` for every viewer, because the shipped iOS Privacy screen writes its local cache only when the key is PRESENT: dropping them read as "keep what I have" and left the toggle ON forever on every phone that had it enabled. **Polls are gone** (new §14.2, §2.13, §12.1, §0): `/polls/*` and `POST /groups/{group_id}/polls` answer `410 Gone` with `{"code": "feature_removed", "feature": "polls"}`, unauthenticated and hidden from the schema, and `/server/info` carries a NEW `polls: false`, which matters because every client defaults an ABSENT capability to true. ⚠ No first-party client reads that key and none is planned to: both composers were deleted outright rather than gated, so the flag exists for third-party clients and for the general rule of §2.13, and the 410 is the whole of the promise permanently rather than until a client release. The ballots were never E2EE: `poll_votes` held voter and option in the clear for every poll including the ones marked anonymous, where anonymity was a filter in the response builder and never a property of the stored row, and `polls.creator_uin` beside `polls.message_id` named the author of one specific encrypted group envelope, which is sealed sender defeated by a side table. The two tables are kept for now with the DROP written down, and the burn reaches them by raw SQL in the meantime so erasure does not wait on an operator. **A sender timestamp now travels with a disappearing message** (new §6.1.3): `ts`, epoch SECONDS, inside the ciphertext beside `ttl` and only ever beside it. Without it a receiver can anchor a countdown only at receipt, so a device that drains a week-old queue keeps a five-minute message for five minutes more. Documented with the receiver rules that matter: a fallback LADDER when it is absent or railed out (the island's deposit stamp first, receipt second, both permitted), and reject a value that is not a positive finite number, more than 60s in the future of receipt, or more than a year before it, because it is attacker-controlled and it moves a deadline. All three first-party clients send `ts` and prefer it; they differ only in the fallback tier they can reach. **The vault gains a second slot and the nudge was fixed** (§4.9, §7.4.4, §2.10): `vault_changed` now goes to the account's OTHER sessions, not to the writer, because the nudge is published before the reply to the write and a writer that heard it first re-read what it had just written in the middle of its own read-merge-write loop. A session whose token carries no install name is NOT skipped, since that is the absence of a name rather than a device. Slot names are client-derived hex the island attaches no meaning to, so a second slot needs no server change of any kind. Flagged gap: `POST /auth/reissue` deletes every slot of the account and announces nothing at all. **Group ownership transfer exists** (new §6.4.8, §6.4.2, §6.4.3, §7.4.5, §12.1, §12.2): `POST /groups/{group_id}/transfer-owner` with `{"to_uin": N}`, owner only, target must be a current member with an account on this island, returns the full `GroupOut`. Until now `owner_uin` could change only by the owner LEAVING, which promotes the oldest member. The outgoing owner stays as a plain member with permissions cleared, and the incoming owner's are cleared too. Five structured error codes, a 10/hour limit, and it rides the existing `group_membership_changed`, whose compact form carries `owner_uin` because the moderator `delete` cap is honoured by the RECEIVING client against a cached roster. **The profile-card gate is documented** (new §3.1.1, §3.1, §3.4): `profile_card_policy`, a fourth tri-state on the user, and the per-viewer verdict `profile_openable` that rides `GET /users/{uin}/info`, `/users/search`, `/contacts`, both group reads, the audio-room `room_roster` and the unauthenticated federation key card. It answers a question none of the other scopes ask, whether the card may be OPENED at all, and it is ANDed into `profile_visibility` so a card nobody may open is also served empty. Two corrections fall out of it: §3.1 said `last_seen` was governed by `last_seen_visibility`, which the card gate now overrides to null for a shut-out viewer, and §3.4's editable-settings list did not carry `profile_card_policy` at all, so an island built to the old text drops the key silently and returns 200 while the client's picker reports a saved setting that does not exist. **UIN ownership** (§2.1, §10.1.3): migration keeps the number you migrated from, which §10.1.3 always claimed and only the shop routes ever did; it refuses to take a number a third party turns out to hold, and releases it past the collection cap. Availability is now the two-table question (`users` and `owned_uins`) on the random allocator, the invite-reserved number and `desired_uin` alike, and a three-way one on the operator paths, which also ask whether a live invite already promises the number. **Corrections, and two of them are not small.** §2.4 said FK-less rows were "deliberately left dangling and garbage-collected by future writes" and never mentioned that a burned owner's groups are DELETED outright: the first has not been true since the purge list was shared with migration, and a recycled number would otherwise inherit the previous holder's queue, drain watermark and moderation history. §10.1.1 still listed "Poll creators + voters" as re-keyed, and now carries the gap the review found: migration re-keys group ownership and membership but never tells the GROUP, so other members' cached rosters keep the old number and per-member sealed group traffic to the migrated user is dropped without an error until each sender refetches. §6.4.2 and §6.4.3 said owner-leave "promotes oldest member" and deletes the group "if the group is empty after"; the rule is the oldest member WITH A LIVE ACCOUNT, preferring an un-suspended one, the promoted member's moderator caps are cleared, and the group is deleted when no membership row has a `users` row behind it, which is not the same as having no members, since a membership row is a bare number that survives the burn of the account it names. That deletion fans no `group_deleted`, because there is nobody left to send it to (new §6.4.2.1). §15.2 still stamped the document v1.8 after two revisions. §14 and §14.1 listed stories, nearby, hood banners, referrals and polls as out of scope rather than deleted, and promised two paid surfaces where one remains; §7.3 and §7.4.9 still described Hood bucket presence as live. |
+| v1.11   | 2026-08-23 | **The chunked media container**, which landed on all three clients the same day and which §9 had no words for at all. Two implementations drift the moment one of them is the only description of the format, so the whole of it is now pinned against the three shipping readers (new §9.4.1 to §9.4.7). **The format.** RCQM1: a 30-byte header in the clear (magic `52 43 51 4d 31`, version `0x01`, `chunkSize` uint32 BE counting PLAINTEXT bytes, `chunkCount` uint32 BE, `plainLen` uint64 BE, and 8 random nonce-prefix bytes fresh per blob), then `chunkCount` records, each `ciphertext(len_i)` followed by its 16-byte tag, every record but the last a full chunk. Big-endian throughout. Nonce for record i is the 8-byte prefix followed by `uint32BE(i)`; AAD for record i is the 30 header bytes exactly as they appear on the wire followed by `uint32BE(i)`. Both derived quantities are written down because a reader recomputes them and refuses a header that disagrees: `chunkCount = ceil(plainLen / chunkSize)` and 1 for an empty plaintext, encoded length `30 + plainLen + 16 * chunkCount`. So are the four bounds a reader applies to the header BEFORE any tag exists to check it with, in order, since the header drives an allocation and a loop first: `plainLen <= 64 GiB` ahead of any arithmetic on it, `64 KiB <= chunkSize <= 16 MiB`, a consistent count, and a length that matches, or an empty stream after the last record for a reader with no declared length. **The integrity property, which is the reason for the shape.** Every structural fact lives in the header and the header is the AAD of every record, so one tag failure is the answer to a record moved, duplicated or dropped, to the file truncated or extended, to the header edited, and to a record lifted out of another blob. Written as the property it is rather than as a list: an RCQM1 container opens completely, in order, exactly as it was sealed, or a tag fails. What it does not bind is which MESSAGE a blob belongs to; that is the envelope's seal, not this format. **The one property chunked AEAD cannot give, recorded rather than claimed away** (§9.4.5): the last record is not verified before the first is used, the same trade Tink's StreamingAEAD and age make, and it is not fixable inside the format. So the clients confine early release to playback and to one platform. Android's `ChunkedDataSource` is the only streaming consumer, and it carries a separate `integrityFailed` flag because `MediaDataSource` cannot report the failure any other way: it answers in byte counts, and a JNI exception comes back as the same `-1` that means the stream ended, so tampering would otherwise be rendered as a short clip. Save, share and export walk every record to the end and publish only on success; iOS decrypts to a scratch file before AVPlayer sees a URL, and the web client verifies every record and requires an empty stream before it builds the Blob. **Selection and detection** (§9.4.6): the container is chosen BY SIZE at the sender, 96 MB of plaintext, strictly greater, and that threshold is deliberately ABOVE the point where the monolithic path had already stopped working rather than below it, so no existing media changes shape and the switch lands where the alternative is not "an older client opens it" but "nobody opens it, including the sender". Detection is BY MAGIC at the reader, six bytes, not thirty, because a monolithic seal can be 28 bytes long; the collision is 1 in 2^48 on a nonce that is ours rather than attacker-chosen. A reader must dispatch on the magic and never on the size: a size test is wrong in both directions. **The release-order hazard** (§9.4.7), which no spec version can enforce: a build that writes containers must not reach users before the builds that read them, because an older build reads the first 12 bytes of the header as a GCM nonce, fails the tag, and has no branch to reach that could say so. The result is a dead bubble indistinguishable from a bad key or a failed download, the sender is told it was delivered, and the most any first-party client says is Android's generic "Could not fetch the file. Check the connection and try again", which blames the network. Android reads and writes; iOS and the web/desktop client read only, deliberately. **The server is unchanged** and stores opaque bytes as it always has, but `/server/info` now advertises `capabilities.media_max_blob_bytes` (§2.13, §9.1) so a client can refuse in the composer instead of at byte 536,870,913 of an upload; absent or `0` means "did not say", not "no limit". **Corrections.** §9.1 claimed a 2 GB `MAX_BLOB_SIZE` backstop; it is 512 MB by default and env-tunable per island, it is enforced while the body streams rather than after it is read whole, and it applies to the ENCODED blob, which for a container is the plaintext plus 30 bytes plus 16 per chunk, so a pre-flight check must compute it rather than compare a file size. §9.3 and §9.4 described a single blob shape and never gave its byte layout at all, which a third implementation cannot guess: the monolithic seal is pinned here for the first time as a 12-byte nonce, then the ciphertext, then a 16-byte tag, with no AAD, CryptoKit's `combined` byte for byte. §9.4's "the server does NOT know" list needed the header disclosure added on the other side: the RCQM1 header is authenticated but NOT confidential, so a container announces its exact plaintext length, its chunk size, and the fact that it is a container, to anyone who can fetch the blob. |
