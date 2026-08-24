@@ -2302,10 +2302,11 @@ indistinguishable from a text message, and it is not indistinguishable now.
 It still does NOT learn who is calling, on which island they live, the call id,
 whether the call is audio or video, or the SDP. All of that is inside the
 sealed envelope, which the island cannot open, so a wake must never invent any
-of it. In particular there is no caller nickname in the payload: a same-island
-VoIP wake carries one because that island knows the caller, and this one
-genuinely does not. The client shows a generic incoming call until it decrypts
-the envelope itself.
+of it. In particular there is no caller nickname in the payload, and since
+2026-08-24 there is none on the same-island road either: that island DOES know
+the caller, which is exactly why it must not tell the push provider (§8.3). The
+client shows a generic incoming call until it decrypts the envelope itself, or
+resolves the name from its own roster.
 
 **And what it discloses to the push provider**, which is a second party and
 easy to forget. The ring travels as a VoIP push through APNs or as a wake to
@@ -3786,12 +3787,23 @@ wake-from-killed via PushKit. Payload is a flat dict:
 {
   "call_id":  "<string>",
   "from_uin": <int>,
-  "nickname": "<string>",
   "media":    "audio|video",
   "sdp":      "<SDP string>",
   "kind":     "end"        // optional, used for early call_end fanout
 }
 ```
+
+⚠ **There is no `nickname` in this payload, as of 2026-08-24.** There was one
+until that date, and it was the strongest identity leak left on any push road:
+Apple, and on the Android path whatever distributor the callee installed, saw
+the CALLER'S NAME beside the callee's number and the time, i.e. a named edge of
+the social graph. It is resolved on the device instead, from `from_uin` against
+the client's own roster cache, exactly as the group name was taken out of the
+message push on 2026-08-22 and resolved from `group_id`. An implementation MUST
+NOT send it. A client SHOULD keep reading it when present, because an island
+running an older build still sends it, and SHOULD fall back to a neutral
+"Incoming call" handle rather than to the bare number when it can resolve
+neither.
 
 PushKit + CallKit constraints require the iOS handler to call
 `reportNewIncomingCall` synchronously upon receipt; a missed
@@ -3880,7 +3892,8 @@ Wake payload (JSON body):
 ```
 
 `type: "call"` carries the flat call dict (`call_id`, `from_uin`,
-`nickname`, `media`, `sdp`) instead, mirroring the VoIP push of §8.3.
+`media`, `sdp`) instead, mirroring the VoIP push of §8.3 (and, like it,
+carrying no `nickname` since 2026-08-24).
 The push server sees ciphertext only: the same opaque envelope APNs
 carries, so the exposure matches Apple's on the iOS path.
 
