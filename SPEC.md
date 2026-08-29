@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.11)
+# RCQ Protocol Specification (v1.13)
 
 ## 0. Status & Scope
 
@@ -43,7 +43,7 @@ Out of scope:
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1.12**. Last updated: **2026-08-24**. Spec maintainer:
+Version: **v1.13**. Last updated: **2026-08-30**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 
 ⚠ **Known gaps.** The endpoint census below was taken on 2026-08-16 against
@@ -2930,9 +2930,18 @@ See Section 7-equivalent endpoints under `/groups/...`:
   roster; this is where a roster-less client comes to get one.
 - `GET /groups/{id}/preview` — lightweight info for a non-member
   considering joining (carries name, description, member count,
-  owner nickname, avatar; does NOT carry membership or history).
-- `GET /groups/search?q=...` — name substring search; excludes
-  groups the caller is already in.
+  owner nickname; does NOT carry membership or history). The avatar
+  pair (`avatar_media_id` + `avatar_media_key`) is served to MEMBERS
+  only: the key is the blob's cleartext AES key and `GET /media/{id}`
+  is unauthenticated, so the pair is the picture. Non-members render
+  the letter tile.
+- `GET /groups/search?q=...` — name substring search over CATALOG
+  rows only (`in_catalog = true`); excludes groups the caller is
+  already in. A room is searchable because its owner listed it
+  (the voluntary catalog, metadata stage 6) and for no other
+  reason. Exact-id lookup stays unfiltered: there the link is the
+  capability, same rule as preview. Search rows never carry the
+  avatar pair.
 - `POST /groups/{id}/join` — self-join (open groups only;
   closed groups require an owner-issued invite).
 - `POST /groups/{id}/members` — invite (any member can invite,
@@ -2942,7 +2951,10 @@ See Section 7-equivalent endpoints under `/groups/...`:
   in §6.4.2.1, or deletes the group when nobody is eligible.
 - `POST /groups/{id}/transfer-owner`: hand the group to another
   member, owner only (§6.4.8).
-- `PATCH /groups/{id}` — partial update of group metadata
+- `PATCH /groups/{id}` — partial update of group metadata.
+  `in_catalog` (admin-or-owner, the `info` capability) publishes or
+  unlists the room in the voluntary catalog; new rooms start
+  unlisted
   (name/description/avatar: admin+; post_policy, is_closed,
   members_hidden: owner only; pinned_text: admin+). (`entry_price`
   is still accepted by the owner-only set but is **vestigial** — the
