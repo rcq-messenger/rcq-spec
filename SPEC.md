@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.13)
+# RCQ Protocol Specification (v1.14)
 
 ## 0. Status & Scope
 
@@ -43,7 +43,7 @@ Out of scope:
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1.13**. Last updated: **2026-08-30**. Spec maintainer:
+Version: **v1.14**. Last updated: **2026-08-30**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 
 ⚠ **Known gaps.** The endpoint census below was taken on 2026-08-16 against
@@ -2951,6 +2951,18 @@ See Section 7-equivalent endpoints under `/groups/...`:
   in §6.4.2.1, or deletes the group when nobody is eligible.
 - `POST /groups/{id}/transfer-owner`: hand the group to another
   member, owner only (§6.4.8).
+- `PATCH /groups/{id}/state` — write the SEALED room identity (stage 6
+  phase 2, `rcq-docs/group-state-seal-design.md`). Body
+  `{state_blob: b64, state_ver: n}`; gate is owner-or-`info`, cap 64 KB.
+  `state_ver` must be exactly the stored version plus one, else 409
+  carrying the version the island holds (the vault's #605 rule at room
+  scale). The blob is deflate-then-AES-256-GCM under the room state key
+  (RSK), which the island never sees: members receive it as a sealed
+  1:1 `gskey {gid, ver, key}` envelope, a joiner by link reads it from
+  the URL FRAGMENT (`#k=`), recovery asks any member with `gsknack`.
+  `GET /groups*` serves `state_blob`+`state_ver` to members beside the
+  open fields; clients that hold the key prefer the blob on read.
+  Listed (catalog) rooms keep name/description in the open on purpose.
 - `PATCH /groups/{id}` — partial update of group metadata.
   `in_catalog` (admin-or-owner, the `info` capability) publishes or
   unlists the room in the voluntary catalog; new rooms start
