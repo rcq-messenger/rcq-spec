@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.14)
+# RCQ Protocol Specification (v1.15)
 
 ## 0. Status & Scope
 
@@ -43,7 +43,7 @@ Out of scope:
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1.14**. Last updated: **2026-08-30**. Spec maintainer:
+Version: **v1.15**. Last updated: **2026-08-30**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 
 ⚠ **Known gaps.** The endpoint census below was taken on 2026-08-16 against
@@ -2970,7 +2970,20 @@ See Section 7-equivalent endpoints under `/groups/...`:
   unlists the room in the voluntary catalog; new rooms start
   unlisted
   (name/description/avatar: admin+; post_policy, is_closed,
-  members_hidden: owner only; pinned_text: admin+). (`entry_price`
+  members_hidden, slowmode_sec, min_account_age_hours: owner only;
+  pinned_text: admin+). `min_account_age_hours` (v1.15, anti-spam age
+  floor) takes one of {0, 1, 6, 24, 72, 168, 720}: a member whose
+  ACCOUNT is younger than that many hours may read but not post a
+  `message` to the room (reactions, reads and control envelopes are
+  unaffected). Enforcement is server-side on both group send paths for
+  AUTHENTICATED senders, with the same phase-1 trust shape as
+  `owner_only` and slowmode: an anonymous sealed post stays on the
+  client-side gate. The owner, admins and members holding any granted
+  capability are exempt. A cross-island guest has no local `users` row
+  to date, so phase 1 admits them. Violation is `403
+  {code: "account_too_young", hours_left: n}`. Related (same release):
+  `sknack` sender-key recovery asks are limited to 10 per hour per
+  account, since one ask fans a sealed payload to every capable member. (`entry_price`
   is still accepted by the owner-only set but is **vestigial** — the
   column survives the 2026-05-27 economy pivot but is no longer charged.)
 - `DELETE /groups/{id}` — owner only; fans out `group_deleted`
