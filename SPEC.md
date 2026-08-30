@@ -2956,8 +2956,10 @@ See Section 7-equivalent endpoints under `/groups/...`:
   `{state_blob: b64, state_ver: n}`; gate is owner-or-`info`, cap 64 KB.
   `state_ver` must be exactly the stored version plus one, else 409
   carrying the version the island holds (the vault's #605 rule at room
-  scale). The blob is deflate-then-AES-256-GCM under the room state key
-  (RSK), which the island never sees: members receive it as a sealed
+  scale). The blob is `[0x02][key_ver u32][nonce 12][AES-256-GCM ct]` over
+  raw-deflated JSON, under the room state key (RSK), which the island
+  never sees (the open key_ver only counts rotations - it is what a
+  keyless client asks for, and what a replacement mint must exceed): members receive it as a sealed
   1:1 `gskey {gid, ver, key}` envelope, a joiner by link reads it from
   the URL FRAGMENT (`#k=`), recovery asks any member with `gsknack`.
   `GET /groups*` serves `state_blob`+`state_ver` to members beside the
