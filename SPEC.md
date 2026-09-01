@@ -136,11 +136,33 @@ Key design choices:
 A UIN is a positive integer in the range `[100_000,
 999_999_999]` (inclusive). Default allocation picks a random
 value in that range, rejecting any that collide with an existing
-account or with a UIN reserved by the UIN shop (`OwnedUin`).
+account or with a UIN reserved by the UIN shop (`OwnedUin`), and
+rejecting RESERVED numbers outright (see below).
 
-Short "vanity" UINs are not part of the default allocator; they
-are obtained through the UIN shop (see Section 14) and assigned
-via the migration endpoint (Section 10).
+**Reserved numbers (since 2026-09-01).** A number is reserved when it is
+SHORT (six digits or fewer) or carries a recognisable SHAPE: all digits the
+same (`4444`), a repeating pair or triple (`1212`, `123123`), the full ladder
+in either direction (`123456789`, `987654321`), or four or more trailing
+zeros. Reserved numbers are finite stock: there are 999 three-digit numbers in
+existence and there will never be more. They are excluded from
+  * the random allocator,
+  * `desired_uin` at registration (§2.2) UNLESS the caller proves prior
+    tenure — a signed home-island record (§3.2) naming that UIN under the
+    caller's own signing key, offered in the request or already mirrored on
+    this island. This is what keeps §5a multihoming working for someone whose
+    number happens to be short, while a squatter, who cannot sign for the key,
+    cannot ask for one at all,
+  * and the free claim of §14.
+
+They are still assignable by an operator: `POST /admin/uin/grant`, or an
+invite minted with the number on it (§2.2).
+
+**Collections are closed.** One identity holds exactly the number it answers
+as. `owned_uins` remains in the schema (and remains part of the availability
+question below) because rows may exist from before; nothing creates new ones,
+account migration returns the vacated number to the pool, and the collection
+cap `max_owned` is reported as 0.
+
 This document treats UINs as opaque integers — the wire format
 does not depend on digit count.
 
@@ -5013,9 +5035,12 @@ protocol:
 - `/audio_rooms` — multi-party voice rooms (mesh WebRTC,
   signalling through the WS channel)
 - `/random` — anonymous random-chat pairing
-- `/uin/quote` + `/uin/purchase` — UIN shop (any free 3-9 digit
-  UIN, IAP-priced by length; the purchase endpoint reuses the
-  account-migration helper from Section 10)
+- `/uin/quote` + `/uin/purchase` — UIN shop (a free ORDINARY 3-9 digit
+  UIN; reserved ones answer `403 {"code": "reserved"}` and quote as
+  `available: false, reason: "reserved"` — see §2.1. IAP-priced by
+  length; the purchase endpoint reuses the account-migration helper from
+  Section 10, and always moves the account rather than adding to a
+  collection)
 - `/reports` — moderation queue, including the bug-bounty
   context tag (`context = "bug_bounty"`); no monetary reward
   is associated with the submission. Three endpoints face the
