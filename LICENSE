@@ -1,0 +1,14 @@
+Creative Commons Attribution 4.0 International (CC BY 4.0)
+
+Copyright (c) 2026 RCQ
+
+This specification is licensed under the Creative Commons Attribution 4.0
+International License. You are free to share and adapt it for any purpose,
+including commercially, provided you give appropriate credit.
+
+Full licence text: https://creativecommons.org/licenses/by/4.0/legalcode
+
+Why this and not AGPL, which covers the RCQ source: a protocol nobody may
+re-document is not a protocol, it is a product feature. An independent
+implementation has to be able to quote this document, and its authors should
+not have to ask.
