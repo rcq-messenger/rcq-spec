@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.15)
+# RCQ Protocol Specification (v1.16)
 
 ## 0. Status & Scope
 
@@ -43,7 +43,7 @@ Out of scope:
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1.15**. Last updated: **2026-08-30**. Spec maintainer:
+Version: **v1.16**. Last updated: **2026-09-02**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 
 ⚠ **Known gaps.** The endpoint census below was taken on 2026-08-16 against
@@ -2992,7 +2992,8 @@ See Section 7-equivalent endpoints under `/groups/...`:
   unlists the room in the voluntary catalog; new rooms start
   unlisted
   (name/description/avatar: admin+; post_policy, is_closed,
-  members_hidden, slowmode_sec, min_account_age_hours: owner only;
+  members_hidden, links_allowed, files_allowed (§6.4.9), slowmode_sec,
+  min_account_age_hours: owner only;
   pinned_text: admin+). `min_account_age_hours` (v1.15, anti-spam age
   floor) takes one of {0, 1, 6, 24, 72, 168, 720}: a member whose
   ACCOUNT is younger than that many hours may read but not post a
@@ -3070,6 +3071,8 @@ Fields on the `Group` row:
 | `entry_price_tokens` | int|null   | null (free) | owner (vestigial; column present but unused since the 2026-05-27 economy pivot) |
 | `is_closed`          | bool       | false       | owner            |
 | `members_hidden`     | bool       | false       | owner            |
+| `links_allowed`      | bool       | true        | owner; client-honoured, the island cannot enforce it (§6.4.9) |
+| `files_allowed`      | bool       | true        | owner; client-honoured, the island cannot enforce it (§6.4.9) |
 | `pinned_text`        | string(500)| null        | admin            |
 | `pinned_at`          | datetime|null | null     | (auto-stamped)   |
 | `pinned_by`          | int|null   | null        | (auto-stamped)   |
@@ -3238,6 +3241,59 @@ the roster with both new roles. A client that handles a rename handles this
 with no new code. Above 100 members the event carries the compact form, which
 for this change is not roster-less: `owner_uin` rides it, and §7.4.5 says why
 that field in particular is worth the bytes.
+
+#### 6.4.9 Room content policy: `links_allowed` and `files_allowed`
+
+Two owner-only booleans on the group, both `true` by default. An island
+older than 2026-08-21 omits them, and absent reads as `true`: an old room
+behaves exactly as it did. Set through `PATCH /groups/{id}`; any caller but
+the owner gets `403 "owner only"`, the same gate as `post_policy` and
+slowmode, because they are rules of the room and not its decoration. The
+group settings on every first-party client expose both; the CLI lists them
+as `no_links` / `no_files` in the rules column of `rcq groups`.
+
+**The island cannot enforce either one.** Every group message is a sealed
+envelope (§6.1, §6.5) and the island branches on `cls` and nothing else; it
+cannot tell a file from a sentence, or a URL from a word. So these two are
+the opposite of `owner_only`, `slowmode_sec` and `min_account_age_hours`,
+which the island checks on the send paths: they are rules the CLIENTS keep
+on the owner's behalf, and a modified client ignores them. Treat them as a
+room's house rules, never as a security boundary.
+
+**What `files_allowed = false` blocks**, the rule as decided 2026-09-02:
+documents, photos and videos. **What it does not block**: voice notes. A
+voice note is a message in spoken form rather than a file somebody is
+putting into the room, and the switch is about files. The line is drawn by
+kind and not by size: a five-second video is refused, a ten-minute voice
+note is not.
+
+**What `links_allowed = false` blocks**: a `message` whose text carries a
+URL (`http://`, `https://`), a caption on media included, and a group
+invite, which is a link by any other name. A client also renders links
+already in the log as plain text for a reader the rule applies to, unless
+the SENDER was exempt, so the owner's announcements stay clickable for
+everyone.
+
+**Who is exempt, both ways**: the owner, every `admin`, and any member
+holding a granted capability of §6.6. Their sends pass, and their links stay
+clickable for every reader. Exemption is by role or by ANY cap: a moderator
+who holds only `info` is exempt too (Android refused such a member for a
+day while the web let them through; the web was right).
+
+**Where a client enforces.** On the SENDER, before the wire, at every path a
+file or a link can enter: the attach menu, share-into-app, drag-and-drop,
+paste, the hardware return key, a draft typed before the switch flipped. The
+refusal is a sentence, not a dead button, and it sits on the send rather
+than only in the menu, since a menu can be open when the owner flips the
+switch and a share arrives from outside the app with no menu at all. A retry
+or a re-send of a row already in the log is never eaten by a rule the room
+grew since. Receiving is not gated: a file that reached the log stays in it.
+
+⚠ **The voice-note exemption is newer than the switch.** The rule above is
+the one decided 2026-09-02. Android 0.160 and the web/desktop build of the
+same day gate the microphone on `files_allowed` too, and iOS gates only the
+document chip; all three converge on the rule written here. An island
+cannot tell the difference, and does not need to.
 
 ### 6.5 Sender keys: one ciphertext for the whole group
 
@@ -4754,6 +4810,223 @@ For deeper background on the transport choices, see the team's
 public posts: the Habr article (Russian) and the dev.to post
 (English) covering the engineering rationale.
 
+### 11.6 Island trust without a certificate authority
+
+Everything above this line assumes the platform trust store: a client dials
+an island over TLS and accepts the chain the operating system accepts, which
+in practice means a certificate somebody issued. That is the right rule for
+`api.rcq.app` and for a self-hosted island with a domain and an ACME
+certificate, and it makes every island depend on an issuer's continued
+willingness to issue. A client following this section trusts an island one
+of TWO ways, and the rule of §11.6.1 says which: through the platform store,
+as before, or by the fingerprint of the certificate the island itself
+presents, pinned on this device the way an SSH host key is. Then no
+certificate authority can cut an island off, and a domain stops being a
+requirement: an island reachable only by an IP literal is a valid island.
+
+This is client behaviour and nothing else. No byte on the wire changes, no
+endpoint is added, and `/server/info` says NOTHING about it: a fingerprint
+read over the very connection it is meant to verify proves nothing. An
+island that keeps its CA certificate is unaffected, and an island that
+switches to a private one needs only what §11.6.6 lists. The reference
+design, with the placement inside each first-party client, is
+`rcq-docs/island-fingerprint-design.md`.
+
+#### 11.6.1 The rule
+
+Applied by the client to EVERY TLS connection it opens to an island host:
+REST, the socket of §7, media of §9, cross-island deposits, `.rcq` site
+reads, reachability probes, and the embedded push socket of §8.7. Never to
+relays (§11.2), the relay config (§11.3), the broker, the island catalogue,
+DNS-over-HTTPS, update checks, or `rcq.app` itself.
+
+```
+decide(host, port, leafDer, caValid):
+  key = lower(host) + ":" + port              # port defaults to 443
+  if caValid:                                 # the platform trust store accepted the chain
+      record[key] = {mode: "ca"}              # a pinned record is overwritten: the island moved to a CA
+      -> ACCEPT
+  if host is CA-only (§11.6.2):
+      -> REFUSE(ca_only)
+  fp = sha256(leafDer)                        # §11.6.3
+  rec = record[key]
+  if rec is null:
+      record[key] = {mode: "pinned", fp, source: "tofu"}
+      -> ACCEPT_FIRST_USE(fp)                 # connect, and say so once (§11.6.5)
+  if rec.mode == "ca":
+      -> REFUSE(changed, old: "ca", new: fp)  # a CA island now shows a private certificate
+  if rec.fp == fp:
+      -> ACCEPT
+  -> REFUSE(changed, old: rec.fp, new: fp)
+```
+
+Both gates a TLS client already has, chain validation and hostname
+verification, run this rule: a pinned record satisfies both, and both are
+decided before a byte of the request is sent. Three things the rule fixes
+on purpose:
+
+- **CA first, pin second.** Let's Encrypt rotates keys on every renewal, so
+  pinning a CA-issued certificate would warn every sixty days. A chain the
+  platform trusts is accepted exactly as before, and the pin store governs
+  ONLY certificates the platform does not trust. A `ca` record is still
+  written, because of the third point.
+- **A refusal is a refusal.** A `.rcq` site renders under a changed key
+  with a banner, because a reader can judge a page. A connection that
+  carries a session token cannot be judged, so a changed certificate is NOT
+  connected to at all until the person decides (§11.6.5). The client is
+  offline for that island in the meantime, and nothing it holds crosses the
+  wire.
+- **A known island cannot be downgraded silently.** Once a host has
+  validated through a CA on this device, a private certificate for it is a
+  CHANGE, not a first use. Without the `ca` record an attacker on the path
+  would only have to wait for a device that had never pinned anything.
+
+Validity dates and subject names of a PINNED certificate are ignored: the
+pin is the identity, and an expired certificate whose hash matches is the
+island. (The CLI is the one first-party client that cannot ignore either;
+§11.6.6 says what that costs the operator.)
+
+#### 11.6.2 CA-only hosts
+
+`api.rcq.app`, the CDN front, and every name under `rcq.app` MUST be trusted
+through the platform store and nothing else. The flagship is never trusted
+on first use, and a private certificate presented by any of these is
+`REFUSE(ca_only)` regardless of what the store holds: no notice, no banner
+with an accept button, because there is no legitimate state in which the
+flagship shows one. These are also the hosts §11.5 already describes the
+relay path terminating TLS against; the relays never see the inside of it.
+
+#### 11.6.3 The fingerprint
+
+SHA-256 over the DER encoding of the leaf certificate exactly as presented.
+This is what `openssl x509 -noout -fingerprint -sha256` prints, which is the
+quantity an operator can produce with tools they already have.
+
+Not the SPKI hash, which is what HPKP pinned. SPKI survives a re-issue on
+the same key, which matters for a CA certificate that rotates every two
+months and not at all for a ten-year self-signed one, and a leaf hash is
+what every tool on an operator's machine agrees on. When an operator
+re-issues, they announce the new fingerprint, exactly like an SSH host key.
+
+| Form | Shape | Where |
+|------|-------|-------|
+| canonical | 64 lowercase hex characters, no separators | the store, the address fragment, anything on the wire |
+| accepted on input | uppercase, colons and spaces (`AB:CD:…` straight from openssl) | every address form; normalised to canonical before use |
+| display | 16 groups of 4, monospace, 4 groups to a line | notices, banners, the Settings row |
+
+#### 11.6.4 Address syntax and the pin store
+
+Every place a person types an island accepts an optional fragment:
+
+```
+203.0.113.5#ab12cd34…            64 hex
+island.example:8443#AB:12:CD:…   the openssl form, any case, colons accepted
+https://203.0.113.5/#ab12…       a pasted URL keeps working
+```
+
+When the fragment is present the client stores `{mode: "pinned", fp,
+source: "typed"}` BEFORE the first connection, and the first connection has
+to MATCH: a mismatch is `REFUSE(changed)`, worded as the island presenting a
+different fingerprint than the one entered. This is the careful path, with
+no trust on first use in it at all. `host[:port]#fp` is the form the
+reference installer prints for an operator to hand out and the form the
+Settings screen copies (§11.6.5).
+
+Normalisation, which every client already does (strip scheme, path and
+trailing slash; keep `host:port`), gains one step: split the fragment off
+FIRST, then normalise the rest. An IP literal is a host like any other. An
+IPv6 literal is written `[::1]:8443` and the store key keeps the brackets.
+
+The store:
+
+| Property | Rule | Why |
+|----------|------|-----|
+| key | `host:port`, lowercase, port explicit (`443` when omitted) | `island.example:443` and `island.example:8443` may be two islands |
+| scope | one store per DEVICE, not per account | a pin is a statement about an island, not about the reader; a per-account store would reset every warning on an account switch, which is the one moment a warning is worth most |
+| record | `{mode: "ca" \| "pinned", fp?, source?: "tofu" \| "typed" \| "accepted", since, noticed?}` | `source` is what the banner and the Settings row say; `noticed` is the once-only first-use notice |
+| storage | device-local, plain, NOT the keychain | a pin is not a secret, and losing it costs a re-trust. The panic wipe clears it with everything else |
+
+#### 11.6.5 Refusal semantics: what the person sees
+
+| Outcome | Connection | Record written | Shown |
+|---------|------------|----------------|-------|
+| `ACCEPT` | opened | `ca`, or unchanged | nothing |
+| `ACCEPT_FIRST_USE` | opened | `pinned`, `source: "tofu"` | ONE non-blocking notice for that host, once ever: the host, its fingerprint in display form, and "compare it with what the operator published". Not a modal: onboarding must not stop on a dialog most people cannot evaluate, and the careful person uses the typed form instead |
+| `REFUSE(changed)` | NOT opened | nothing, until the person acts | a red banner on the main screen naming the host, the fingerprint on file (or "a certificate authority") and the one presented, with two choices: trust the new fingerprint, which writes `{mode: "pinned", fp, source: "accepted"}` and reconnects, or not now, which leaves the banner up and the island refused |
+| `REFUSE(ca_only)` | NOT opened | nothing | a plain connection failure; there is no accept button for the flagship |
+
+The trust layer exposes the set of hosts in the `changed` state and the UI
+draws from it; nothing else in a client has to remember to check, which is
+what makes "a refusal is a refusal" hold across every path of §11.6.1 rather
+than only the ones somebody instrumented.
+
+Settings show, per island, how it is trusted: through a certificate
+authority, or by fingerprint with the fingerprint in display form and a
+copy action that yields `host:port#fp`.
+
+⚠ **A browser cannot do this.** Nothing lets a page tell the browser to
+trust a private certificate, and neither can the webview the desktop app
+wraps, which is why the desktop terminates TLS for fingerprint islands on
+its own side (the design has a loopback forwarder). The web client shows a
+hint when the typed address carries a fragment or is an IP literal: such an
+island opens in the phone and desktop apps, not in a browser.
+
+#### 11.6.6 What an island MUST do to be usable this way
+
+- **Present a long-lived leaf.** The pin is the hash of the leaf, so every
+  re-issue is a change that every user has to accept by hand, the way a new
+  SSH host key is. The reference installer issues a self-signed EC P-256
+  certificate for 3650 days (`install.sh` with no domain, or
+  `RCQ_TLS=fingerprint`). A certificate that renews on a schedule is a CA
+  certificate's habit and defeats the mode.
+- **Name the address in the SAN**: the IP literal, and any hostname, that
+  users will type. The phone and desktop clients ignore names and dates
+  under a pin (§11.6.1); the CLI cannot, because Node's trust store is the
+  only verifier its `fetch` and `WebSocket` take, so it loads the pinned
+  certificate as a trust anchor and Node checks the name. A hand-made
+  certificate without the SAN works everywhere but there, and the CLI says
+  so.
+- **Publish the fingerprint out of band**: on the island's own page, in a
+  chat, in the invite, as `host[:port]#fp`. `deploy/island-fingerprint.sh`
+  prints it in canonical and display form. Nothing carried on the island's
+  own connection is proof, so `/server/info` does not carry it and MUST NOT
+  be made to.
+- **Offer HTTP/1.1 in ALPN as well as h2**: the desktop forwarder speaks
+  `http/1.1` only.
+- **To move to a CA later, do nothing on the client side.** The first
+  handshake the platform trusts overwrites the pin with a `ca` record
+  (§11.6.1), silently, for every user. The reverse direction, CA to
+  private, is the change every user must accept, on purpose.
+
+Operators who would rather keep a CA have two answers that need no client
+at all and belong in the self-host instructions: DNS-01 (issuance against a
+DNS record, so a server the issuer cannot reach still renews) and an ACME
+CA other than Let's Encrypt (Buypass without EAB; ZeroSSL and Google Trust
+Services with it). Both are configuration of the reference island's Caddy
+and are outside this document.
+
+#### 11.6.7 The residual risk, stated plainly
+
+The FIRST contact with an unknown island on a hostile network pins the
+attacker. That is trust on first use, the same trade SSH and the `.rcq` site
+keys make, and this section does not claim otherwise. The two honest
+mitigations are the typed fingerprint of §11.6.4, which takes first use out
+of the path entirely, and the first-use notice of §11.6.5, which says out
+loud that a pin was just taken.
+
+What holds regardless of who terminates TLS is everything §13.1 attributes
+to E2EE. An impostor island is a hostile island: it sees what any island
+sees, the metadata of §13.1 and every sealed envelope, and it holds whatever
+bearer token the client presents on that connection (§2.5) for as long as
+that token lives. It reads no message body, because nothing that opens an
+envelope ever crosses the wire. Its powers are a compromised backend's
+powers over that account and not one more.
+
+What the rule defends fully is every contact AFTER the first. An attacker
+who takes the path to an island this device already knows, by CA or by pin,
+gets `REFUSE(changed)` and nothing else: no request, no token and no
+envelope cross that connection until a person reads the banner and chooses.
+
 ## 12. Error Codes & Rate Limits
 
 ### 12.1 HTTP error conventions
@@ -5215,7 +5488,7 @@ implementation already does) may go straight to PR.
 
 ### 15.2 Versioning
 
-This document is **v1.12**. The protocol wire major is still v1;
+This document is **v1.16**. The protocol wire major is still v1;
 the `.x` suffix tracks doc revisions. Wire-breaking changes would
 bump the major. Additive endpoints, new optional fields, and new
 envelope types do not require a major bump; they are recorded in
@@ -5251,3 +5524,7 @@ rather than a field (§9.4.7), and a spec version cannot enforce that. Read
 | v1.10   | 2026-08-23 | Five protocol changes and a correction pass. Nothing here breaks the wire for an old client: every removed surface still answers, every addition is optional, and an island that has not shipped this behaves as it did. Several of them change what the island ANSWERS, which is why this is a revision rather than an editorial fix. **Presence after leaving is gone** (§3.3, §3.1, §3.4): `presence_persistent` and `presence_ttl_minutes` are unmapped, out of `ProfileUpdate`, out of the validation, and the per-user expiry timer that fanned out the delayed offline went with them. Presence is one rule for every account now, fresh `last_seen` or offline, with no opt-out; somebody who wants to look offline while connected picks `invisible`. The setting could not do what its own screen promised: no shipped client ever sent the duration, only the boolean, so the column stayed NULL and NULL meant FOREVER, and even with a duration the window was anchored on `last_seen`, which the 25s heartbeat rewrites, so the countdown restarted on every ping instead of burning down. Both keys stay on the wire, pinned to `false` and `null` for every viewer, because the shipped iOS Privacy screen writes its local cache only when the key is PRESENT: dropping them read as "keep what I have" and left the toggle ON forever on every phone that had it enabled. **Polls are gone** (new §14.2, §2.13, §12.1, §0): `/polls/*` and `POST /groups/{group_id}/polls` answer `410 Gone` with `{"code": "feature_removed", "feature": "polls"}`, unauthenticated and hidden from the schema, and `/server/info` carries a NEW `polls: false`, which matters because every client defaults an ABSENT capability to true. ⚠ No first-party client reads that key and none is planned to: both composers were deleted outright rather than gated, so the flag exists for third-party clients and for the general rule of §2.13, and the 410 is the whole of the promise permanently rather than until a client release. The ballots were never E2EE: `poll_votes` held voter and option in the clear for every poll including the ones marked anonymous, where anonymity was a filter in the response builder and never a property of the stored row, and `polls.creator_uin` beside `polls.message_id` named the author of one specific encrypted group envelope, which is sealed sender defeated by a side table. The two tables are kept for now with the DROP written down, and the burn reaches them by raw SQL in the meantime so erasure does not wait on an operator. **A sender timestamp now travels with a disappearing message** (new §6.1.3): `ts`, epoch SECONDS, inside the ciphertext beside `ttl` and only ever beside it. Without it a receiver can anchor a countdown only at receipt, so a device that drains a week-old queue keeps a five-minute message for five minutes more. Documented with the receiver rules that matter: a fallback LADDER when it is absent or railed out (the island's deposit stamp first, receipt second, both permitted), and reject a value that is not a positive finite number, more than 60s in the future of receipt, or more than a year before it, because it is attacker-controlled and it moves a deadline. All three first-party clients send `ts` and prefer it; they differ only in the fallback tier they can reach. **The vault gains a second slot and the nudge was fixed** (§4.9, §7.4.4, §2.10): `vault_changed` now goes to the account's OTHER sessions, not to the writer, because the nudge is published before the reply to the write and a writer that heard it first re-read what it had just written in the middle of its own read-merge-write loop. A session whose token carries no install name is NOT skipped, since that is the absence of a name rather than a device. Slot names are client-derived hex the island attaches no meaning to, so a second slot needs no server change of any kind. Flagged gap: `POST /auth/reissue` deletes every slot of the account and announces nothing at all. **Group ownership transfer exists** (new §6.4.8, §6.4.2, §6.4.3, §7.4.5, §12.1, §12.2): `POST /groups/{group_id}/transfer-owner` with `{"to_uin": N}`, owner only, target must be a current member with an account on this island, returns the full `GroupOut`. Until now `owner_uin` could change only by the owner LEAVING, which promotes the oldest member. The outgoing owner stays as a plain member with permissions cleared, and the incoming owner's are cleared too. Five structured error codes, a 10/hour limit, and it rides the existing `group_membership_changed`, whose compact form carries `owner_uin` because the moderator `delete` cap is honoured by the RECEIVING client against a cached roster. **The profile-card gate is documented** (new §3.1.1, §3.1, §3.4): `profile_card_policy`, a fourth tri-state on the user, and the per-viewer verdict `profile_openable` that rides `GET /users/{uin}/info`, `/users/search`, `/contacts`, both group reads, the audio-room `room_roster` and the unauthenticated federation key card. It answers a question none of the other scopes ask, whether the card may be OPENED at all, and it is ANDed into `profile_visibility` so a card nobody may open is also served empty. Two corrections fall out of it: §3.1 said `last_seen` was governed by `last_seen_visibility`, which the card gate now overrides to null for a shut-out viewer, and §3.4's editable-settings list did not carry `profile_card_policy` at all, so an island built to the old text drops the key silently and returns 200 while the client's picker reports a saved setting that does not exist. **UIN ownership** (§2.1, §10.1.3): migration keeps the number you migrated from, which §10.1.3 always claimed and only the shop routes ever did; it refuses to take a number a third party turns out to hold, and releases it past the collection cap. Availability is now the two-table question (`users` and `owned_uins`) on the random allocator, the invite-reserved number and `desired_uin` alike, and a three-way one on the operator paths, which also ask whether a live invite already promises the number. **Corrections, and two of them are not small.** §2.4 said FK-less rows were "deliberately left dangling and garbage-collected by future writes" and never mentioned that a burned owner's groups are DELETED outright: the first has not been true since the purge list was shared with migration, and a recycled number would otherwise inherit the previous holder's queue, drain watermark and moderation history. §10.1.1 still listed "Poll creators + voters" as re-keyed, and now carries the gap the review found: migration re-keys group ownership and membership but never tells the GROUP, so other members' cached rosters keep the old number and per-member sealed group traffic to the migrated user is dropped without an error until each sender refetches. §6.4.2 and §6.4.3 said owner-leave "promotes oldest member" and deletes the group "if the group is empty after"; the rule is the oldest member WITH A LIVE ACCOUNT, preferring an un-suspended one, the promoted member's moderator caps are cleared, and the group is deleted when no membership row has a `users` row behind it, which is not the same as having no members, since a membership row is a bare number that survives the burn of the account it names. That deletion fans no `group_deleted`, because there is nobody left to send it to (new §6.4.2.1). §15.2 still stamped the document v1.8 after two revisions. §14 and §14.1 listed stories, nearby, hood banners, referrals and polls as out of scope rather than deleted, and promised two paid surfaces where one remains; §7.3 and §7.4.9 still described Hood bucket presence as live. |
 | v1.11   | 2026-08-23 | **The chunked media container**, which landed on all three clients the same day and which §9 had no words for at all. Two implementations drift the moment one of them is the only description of the format, so the whole of it is now pinned against the three shipping readers (new §9.4.1 to §9.4.7). **The format.** RCQM1: a 30-byte header in the clear (magic `52 43 51 4d 31`, version `0x01`, `chunkSize` uint32 BE counting PLAINTEXT bytes, `chunkCount` uint32 BE, `plainLen` uint64 BE, and 8 random nonce-prefix bytes fresh per blob), then `chunkCount` records, each `ciphertext(len_i)` followed by its 16-byte tag, every record but the last a full chunk. Big-endian throughout. Nonce for record i is the 8-byte prefix followed by `uint32BE(i)`; AAD for record i is the 30 header bytes exactly as they appear on the wire followed by `uint32BE(i)`. Both derived quantities are written down because a reader recomputes them and refuses a header that disagrees: `chunkCount = ceil(plainLen / chunkSize)` and 1 for an empty plaintext, encoded length `30 + plainLen + 16 * chunkCount`. So are the four bounds a reader applies to the header BEFORE any tag exists to check it with, in order, since the header drives an allocation and a loop first: `plainLen <= 64 GiB` ahead of any arithmetic on it, `64 KiB <= chunkSize <= 16 MiB`, a consistent count, and a length that matches, or an empty stream after the last record for a reader with no declared length. **The integrity property, which is the reason for the shape.** Every structural fact lives in the header and the header is the AAD of every record, so one tag failure is the answer to a record moved, duplicated or dropped, to the file truncated or extended, to the header edited, and to a record lifted out of another blob. Written as the property it is rather than as a list: an RCQM1 container opens completely, in order, exactly as it was sealed, or a tag fails. What it does not bind is which MESSAGE a blob belongs to; that is the envelope's seal, not this format. **The one property chunked AEAD cannot give, recorded rather than claimed away** (§9.4.5): the last record is not verified before the first is used, the same trade Tink's StreamingAEAD and age make, and it is not fixable inside the format. So the clients confine early release to playback and to one platform. Android's `ChunkedDataSource` is the only streaming consumer, and it carries a separate `integrityFailed` flag because `MediaDataSource` cannot report the failure any other way: it answers in byte counts, and a JNI exception comes back as the same `-1` that means the stream ended, so tampering would otherwise be rendered as a short clip. Save, share and export walk every record to the end and publish only on success; iOS decrypts to a scratch file before AVPlayer sees a URL, and the web client verifies every record and requires an empty stream before it builds the Blob. **Selection and detection** (§9.4.6): the container is chosen BY SIZE at the sender, 96 MB of plaintext, strictly greater, and that threshold is deliberately ABOVE the point where the monolithic path had already stopped working rather than below it, so no existing media changes shape and the switch lands where the alternative is not "an older client opens it" but "nobody opens it, including the sender". Detection is BY MAGIC at the reader, six bytes, not thirty, because a monolithic seal can be 28 bytes long; the collision is 1 in 2^48 on a nonce that is ours rather than attacker-chosen. A reader must dispatch on the magic and never on the size: a size test is wrong in both directions. **The release-order hazard** (§9.4.7), which no spec version can enforce: a build that writes containers must not reach users before the builds that read them, because an older build reads the first 12 bytes of the header as a GCM nonce, fails the tag, and has no branch to reach that could say so. The result is a dead bubble indistinguishable from a bad key or a failed download, the sender is told it was delivered, and the most any first-party client says is Android's generic "Could not fetch the file. Check the connection and try again", which blames the network. Android reads and writes; iOS and the web/desktop client read only, deliberately. **The server is unchanged** and stores opaque bytes as it always has, but `/server/info` now advertises `capabilities.media_max_blob_bytes` (§2.13, §9.1) so a client can refuse in the composer instead of at byte 536,870,913 of an upload; absent or `0` means "did not say", not "no limit". **Corrections.** §9.1 claimed a 2 GB `MAX_BLOB_SIZE` backstop; it is 512 MB by default and env-tunable per island, it is enforced while the body streams rather than after it is read whole, and it applies to the ENCODED blob, which for a container is the plaintext plus 30 bytes plus 16 per chunk, so a pre-flight check must compute it rather than compare a file size. §9.3 and §9.4 described a single blob shape and never gave its byte layout at all, which a third implementation cannot guess: the monolithic seal is pinned here for the first time as a 12-byte nonce, then the ciphertext, then a 16-byte tag, with no AAD, CryptoKit's `combined` byte for byte. §9.4's "the server does NOT know" list needed the header disclosure added on the other side: the RCQM1 header is authenticated but NOT confidential, so a container announces its exact plaintext length, its chunk size, and the fact that it is a container, to anyone who can fetch the blob. |
 | v1.12   | 2026-08-24 | **An island can have a picture.** Until now the name and the welcome text were the whole of what an island could say about itself, and every client drew it as a generated lettered tile; a self-hoster with a logo had nowhere to put it. New `capabilities`-adjacent field `logo_version` on `GET /server/info` and a new unauthenticated `GET /server/logo` (§2.13, §2.13.1). **What rides on `/server/info` is a 12-character digest, never the image and never a URL**, and both halves matter: that reply is read on every connect and by the cross-island probe paths, so an inlined data URI would put a picture on all of them every time with no way to revalidate it separately from the flags; and a URL would let an island the caller has no account on name a third-party host and collect the request. The client builds `https://<host>/server/logo?v=<version>` itself. **The fallback is the feature** (§2.13.1): no logo, an island too old for the field, an island that did not answer, and bytes that will not decode all resolve to the same lettered tile, generated from the island's initial on an FNV-1a tint of its host so the four first-party clients agree on the colour. There is no state in which a broken image or an empty box stands where an island belongs. **The cap refuses rather than truncates**: 64 KB decoded, PNG/JPEG/WEBP/GIF, `400 logo_too_large` with the island keeping the logo it had, because a truncated image is exactly the broken picture the fallback rule exists to prevent. Additive in both directions: an island that has not shipped this omits the field and every client draws the tile, and a client that has not shipped it ignores the field and does the same. |
+| v1.13   | 2026-08-30 | **The voluntary catalog and the member-only avatar pair** (§6.4.2). `GET /groups/search` matches CATALOG rows only, `in_catalog = true`, set through `PATCH /groups/{id}` by an admin or the owner (the `info` gate, since publishing a name is metadata in the same sense as the name); new rooms start unlisted, and a room is searchable because its owner listed it and for no other reason. Exact-id lookup and the preview stay unfiltered: there the link is the capability. The avatar pair (`avatar_media_id` + `avatar_media_key`) is served to MEMBERS only and never on a search row: the key is the blob's cleartext AES key and `GET /media/{id}` is unauthenticated, so the pair is the picture. Additive; an old client that searches sees fewer rows and nothing breaks. Stamped without a row on the day; backfilled in v1.16. |
+| v1.14   | 2026-08-30 | **The sealed room identity write** (§6.4.2, stage 6 phase 2, `rcq-docs/group-state-seal-design.md`). `PATCH /groups/{id}/state` with `{state_blob, state_ver}`, owner-or-`info`, 64 KB; `state_ver` must be exactly the stored version plus one, else 409 carrying the version the island holds, the vault's #605 rule at room scale. The blob is `[0x02][key_ver u32][nonce 12][AES-256-GCM ct]` over raw-deflated JSON under the room state key (RSK), which the island never sees: members receive it as a sealed 1:1 `gskey {gid, ver, key}` envelope, a joiner by link reads it from the URL FRAGMENT (`#k=`), and recovery asks any member with `gsknack`. `GET /groups*` serves `state_blob` + `state_ver` to members beside the open fields, and a client holding the key prefers the blob on read. Listed rooms keep name and description in the open on purpose. The open `key_ver` prefix landed the same day without a stamp of its own. Additive. Backfilled in v1.16. |
+| v1.15   | 2026-08-30 | **The anti-spam age floor and the `sknack` budget** (§6.4.2). `min_account_age_hours`, owner only, one of {0, 1, 6, 24, 72, 168, 720}: a member whose ACCOUNT is younger than that may read but not post a `message`; reactions, reads and control envelopes are unaffected. Enforced by the island on both group send paths for AUTHENTICATED senders, the same phase-1 shape as `owner_only` and slowmode, so an anonymous sealed post stays on the client gate; the owner, admins and any cap holder are exempt, and a cross-island guest has no local `users` row to date and is admitted. Violation is `403 {code: "account_too_young", hours_left: n}`. `sknack` sender-key recovery asks are limited to 10 per hour per account, since one ask fans a sealed payload to every capable member. Additive. Backfilled in v1.16. |
+| v1.16   | 2026-09-02 | **Island trust without a certificate authority** (new §11.6). A client trusts an island one of two ways: through the platform trust store as before, or, when the platform refuses the chain, by the SHA-256 of the DER leaf, pinned on the device the way an SSH host key is. The rule in full (§11.6.1): a CA-valid chain is accepted and writes a `ca` record even over a pin, so a Let's Encrypt renewal never warns and an island that moves to a CA needs nothing from its users; an unknown host with a private certificate is accepted on first use and said out loud once; a pinned host whose leaf changed, or a CA host now showing a private certificate, is NOT connected to at all until a person accepts the new fingerprint from a banner. The CA-only list, `api.rcq.app`, the front and everything under `rcq.app`, is never trusted on first use (§11.6.2). The canonical, accepted and display forms of the fingerprint, and why it is the leaf and not the SPKI (§11.6.3); the `host[:port]#fp` fragment every address form takes, which pins BEFORE the first connection and turns a mismatch into a refusal, and the device-scoped `host:port` store (§11.6.4); the four outcomes and what each one shows, and why a browser is left out (§11.6.5); what an island must do, a long-lived leaf with the address in the SAN, and why the CLI alone needs the SAN (§11.6.6); and the residual risk written down rather than claimed away: a first contact on a hostile network pins the attacker, and an impostor island is a hostile island with a hostile island's powers and no more (§11.6.7). No byte on the wire changes and `/server/info` deliberately does not carry the fingerprint. **`links_allowed` and `files_allowed` documented** (§6.4.3, §6.4.2, new §6.4.9): two owner-only booleans have lived on the island since 2026-08-21 and this document had no words for them. They are the first group rules the island CANNOT enforce, since it cannot see inside a sealed envelope, so they are house rules the clients keep on the owner's behalf and never a security boundary. `files_allowed = false` blocks documents, photos and videos and not voice notes, the rule decided 2026-09-02; ⚠ the clients shipped on that date still gate the microphone (Android 0.160, the web) or only the document chip (iOS). Exemption is the owner, admins and any granted cap, both ways. **Corrections.** §15.2 still stamped the document v1.12, and this history stopped there while the title had been stamped v1.13, v1.14 and v1.15 on 2026-08-30 without a row each; the three rows above are backfilled from the diffs, and the reserved-number change to §2.1 of 2026-09-01 also went through unstamped. |
