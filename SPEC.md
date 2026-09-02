@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.16)
+# RCQ Protocol Specification (v1.17)
 
 ## 0. Status & Scope
 
@@ -43,7 +43,7 @@ Out of scope:
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1.16**. Last updated: **2026-09-02**. Spec maintainer:
+Version: **v1.17**. Last updated: **2026-09-02**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 
 ⚠ **Known gaps.** The endpoint census below was taken on 2026-08-16 against
@@ -3268,11 +3268,16 @@ kind and not by size: a five-second video is refused, a ten-minute voice
 note is not.
 
 **What `links_allowed = false` blocks**: a `message` whose text carries a
-URL (`http://`, `https://`), a caption on media included, and a group
-invite, which is a link by any other name. A client also renders links
-already in the log as plain text for a reader the rule applies to, unless
-the SENDER was exempt, so the owner's announcements stay clickable for
-everyone.
+URL (`http://`, `https://`), a caption on media included, a group invite,
+which is a link by any other name, and a `.rcq` site address (`blog.rcq` in
+a message opens the reader the first-party clients ship), which the
+renderers already treat as a link and already keep literal under this rule,
+so the send side has to agree with the render side. A client also renders
+links already in the log as plain text for a reader the rule applies to,
+unless the SENDER was exempt, so the owner's announcements stay clickable for
+everyone. ⚠ The send gates in Android 0.160 and the web of 2026-09-02 test
+only `http(s)://`, so a `.rcq` address still passes them while the same
+build draws it as a link; they converge on the set written here.
 
 **Who is exempt, both ways**: the owner, every `admin`, and any member
 holding a granted capability of §6.6. Their sends pass, and their links stay
@@ -4842,14 +4847,21 @@ DNS-over-HTTPS, update checks, or `rcq.app` itself.
 
 ```
 decide(host, port, leafDer, caValid):
+  # caValid: the platform accepted the chain FOR THIS HOST, chain and name both.
+  # Runs on every handshake, whichever way platform validation went.
   key = lower(host) + ":" + port              # port defaults to 443
-  if caValid:                                 # the platform trust store accepted the chain
-      record[key] = {mode: "ca"}              # a pinned record is overwritten: the island moved to a CA
-      -> ACCEPT
-  if host is CA-only (§11.6.2):
-      -> REFUSE(ca_only)
-  fp = sha256(leafDer)                        # §11.6.3
+  fp  = sha256(leafDer)                       # §11.6.3
   rec = record[key]
+  if host is CA-only (§11.6.2):
+      -> ACCEPT if caValid else REFUSE(ca_only)   # never pinned, typed or not
+  if rec is not null and rec.source == "typed":
+      if rec.fp == fp:
+          -> ACCEPT                           # the fingerprint the person entered; caValid changes nothing
+      -> REFUSE(changed, old: rec.fp, new: fp, ca: caValid)
+                                              # an authority's signature is not the identity they typed
+  if caValid:
+      record[key] = {mode: "ca"}              # a tofu or accepted pin is overwritten: the island moved to a CA
+      -> ACCEPT
   if rec is null:
       record[key] = {mode: "pinned", fp, source: "tofu"}
       -> ACCEPT_FIRST_USE(fp)                 # connect, and say so once (§11.6.5)
@@ -4860,26 +4872,51 @@ decide(host, port, leafDer, caValid):
   -> REFUSE(changed, old: rec.fp, new: fp)
 ```
 
-Both gates a TLS client already has, chain validation and hostname
-verification, run this rule: a pinned record satisfies both, and both are
-decided before a byte of the request is sent. Three things the rule fixes
-on purpose:
+`caValid` is BOTH gates a TLS client already has, chain validation and
+hostname verification, for the host that was dialled; a chain the platform
+trusts for some other name is not `caValid`. The rule runs on every
+handshake, on the success of platform validation as much as on its failure,
+and both gates are decided before a byte of the request is sent; a pinned
+record satisfies both. Five things the rule fixes on purpose:
 
 - **CA first, pin second.** Let's Encrypt rotates keys on every renewal, so
   pinning a CA-issued certificate would warn every sixty days. A chain the
   platform trusts is accepted exactly as before, and the pin store governs
   ONLY certificates the platform does not trust. A `ca` record is still
-  written, because of the third point.
+  written, because of the last point. One exception, next.
+- **A typed fingerprint wins over an authority.** A person who entered
+  `host#fp` (§11.6.4) handed the client the island's identity out of band,
+  and nothing that arrives over the network, an authority's signature
+  included, overrides it: a chain that does not hash to the typed value is a
+  change, CA-valid or not. Otherwise whoever could obtain a platform-trusted
+  certificate for the address (Let's Encrypt issues for IP literals, and a
+  route or DNS hijacker passes its challenge) would replace the typed pin
+  silently, take the bearer token, and leave the real island to be the one
+  refused. The cost falls on an operator who moves from a fingerprint to a
+  CA: users who typed the fingerprint see the banner once and accept, which
+  records `ca` (§11.6.5); users who pinned on first use or from a banner move
+  silently.
+- **`caValid` is chain AND name.** A client whose chain validator does not
+  check the name (Android's `X509TrustManager` does not, unless told to) must
+  check it itself before writing `ca`, or a captive portal's valid
+  certificate for its own name writes `ca` over an island's pin, and the
+  island's own certificate comes back as a change.
 - **A refusal is a refusal.** A `.rcq` site renders under a changed key
   with a banner, because a reader can judge a page. A connection that
   carries a session token cannot be judged, so a changed certificate is NOT
   connected to at all until the person decides (§11.6.5). The client is
   offline for that island in the meantime, and nothing it holds crosses the
-  wire.
+  wire. A refusal is also not a blocked route: a client that falls back to
+  relays or a front when the direct path fails (§11.2 to §11.5) learns a
+  refusal as reachable-and-refused, and does not engage, retry or route
+  around it, or report it to the broker as censorship.
 - **A known island cannot be downgraded silently.** Once a host has
   validated through a CA on this device, a private certificate for it is a
   CHANGE, not a first use. Without the `ca` record an attacker on the path
-  would only have to wait for a device that had never pinned anything.
+  would only have to wait for a device that had never pinned anything, which
+  is every device whose client consults the store only when the platform
+  refuses: such a client has no `ca` records at all. Hence the rule on the
+  success branch.
 
 Validity dates and subject names of a PINNED certificate are ignored: the
 pin is the identity, and an expired certificate whose hash matches is the
@@ -4924,18 +4961,44 @@ island.example:8443#AB:12:CD:…   the openssl form, any case, colons accepted
 https://203.0.113.5/#ab12…       a pasted URL keeps working
 ```
 
-When the fragment is present the client stores `{mode: "pinned", fp,
-source: "typed"}` BEFORE the first connection, and the first connection has
-to MATCH: a mismatch is `REFUSE(changed)`, worded as the island presenting a
-different fingerprint than the one entered. This is the careful path, with
-no trust on first use in it at all. `host[:port]#fp` is the form the
-reference installer prints for an operator to hand out and the form the
-Settings screen copies (§11.6.5).
+When the fragment is present and the store holds nothing for `host:port`,
+the client stores `{mode: "pinned", fp, source: "typed"}` BEFORE the first
+connection, and the first connection has to MATCH, as does every one after
+it: a chain that hashes to anything else is `REFUSE(changed)` whether or not
+an authority signed it (§11.6.1), worded as the island presenting a
+different fingerprint than the one entered. This is the careful path: there
+is no first use in it, and nothing on the network, a certificate authority
+included, can widen it. What it does not defend against is a person handed
+the wrong fingerprint. `host[:port]#fp` is the form the reference installer
+prints for an operator to hand out and the form the Settings screen copies
+(§11.6.5).
+
+When the store already holds a record for that key that DISAGREES, a
+different fingerprint or `ca`, the fragment is not written: it is
+`REFUSE(changed)` with the banner of §11.6.5, old: what is on file (or "a
+certificate authority"), new: the typed value, and no connection is made
+until the person chooses; accepting writes the typed value as `{mode:
+"pinned", fp, source: "typed"}`. Only a null record is pre-pinned silently.
+The accepted forms include a pasted URL, and an address that arrives in a
+chat or an invite for an island this device already trusts MUST NOT be able
+to replace that trust because somebody opened it; that would be the one
+downgrade §11.6.1 says is always a change, with no banner. A fragment equal
+to what is on file is a no-op.
+
+A fragment that does not normalise to 64 hex characters (a typo, a
+truncated fingerprint, the `#k=…` of a group invite of §6.4.2 pasted into
+the wrong field) is an ADDRESS ERROR: the form says so and no connection is
+made. A client that drops the bad fragment and connects takes a first-use
+pin while the person believes they pinned, which on a hostile network pins
+the attacker under the cover of the careful path. A fragment on a CA-only
+host (§11.6.2) is an address error too.
 
 Normalisation, which every client already does (strip scheme, path and
 trailing slash; keep `host:port`), gains one step: split the fragment off
-FIRST, then normalise the rest. An IP literal is a host like any other. An
-IPv6 literal is written `[::1]:8443` and the store key keeps the brackets.
+FIRST, then normalise the rest; the normalisers in place today drop a
+fragment without a word, which is exactly the failure above. An IP literal
+is a host like any other. An IPv6 literal is written `[::1]:8443` and the
+store key keeps the brackets.
 
 The store:
 
@@ -4952,13 +5015,16 @@ The store:
 |---------|------------|----------------|-------|
 | `ACCEPT` | opened | `ca`, or unchanged | nothing |
 | `ACCEPT_FIRST_USE` | opened | `pinned`, `source: "tofu"` | ONE non-blocking notice for that host, once ever: the host, its fingerprint in display form, and "compare it with what the operator published". Not a modal: onboarding must not stop on a dialog most people cannot evaluate, and the careful person uses the typed form instead |
-| `REFUSE(changed)` | NOT opened | nothing, until the person acts | a red banner on the main screen naming the host, the fingerprint on file (or "a certificate authority") and the one presented, with two choices: trust the new fingerprint, which writes `{mode: "pinned", fp, source: "accepted"}` and reconnects, or not now, which leaves the banner up and the island refused |
+| `REFUSE(changed)` | NOT opened | nothing, until the person acts | a red banner on the main screen naming the host, the fingerprint on file (or "a certificate authority"; and saying so when the person typed it) and the one presented, with two choices: trust the new fingerprint, which writes `{mode: "pinned", fp, source: "accepted"}` and reconnects, or `{mode: "ca"}` when the refused chain was CA-valid (a typed pin against an island that moved to an authority; pinning a leaf an authority rotates would bring the banner back at the next renewal), or not now, which leaves the banner up and the island refused |
 | `REFUSE(ca_only)` | NOT opened | nothing | a plain connection failure; there is no accept button for the flagship |
 
 The trust layer exposes the set of hosts in the `changed` state and the UI
 draws from it; nothing else in a client has to remember to check, which is
 what makes "a refusal is a refusal" hold across every path of §11.6.1 rather
-than only the ones somebody instrumented.
+than only the ones somebody instrumented. For the same reason a
+reachability probe answers with three states, reachable, refused and
+unreachable, never a boolean: a client that folded a refusal into
+"unreachable" would hand it to its route ladder and go looking for relays.
 
 Settings show, per island, how it is trusted: through a certificate
 authority, or by fingerprint with the fingerprint in display form and a
@@ -4993,10 +5059,13 @@ island opens in the phone and desktop apps, not in a browser.
   be made to.
 - **Offer HTTP/1.1 in ALPN as well as h2**: the desktop forwarder speaks
   `http/1.1` only.
-- **To move to a CA later, do nothing on the client side.** The first
-  handshake the platform trusts overwrites the pin with a `ca` record
-  (§11.6.1), silently, for every user. The reverse direction, CA to
-  private, is the change every user must accept, on purpose.
+- **To move to a CA later, do nothing on the client side, except for the
+  users who typed the fingerprint.** The first handshake the platform trusts
+  overwrites a first-use or accepted pin with a `ca` record (§11.6.1),
+  silently. A TYPED pin is the person's own statement and moves only when
+  they accept the banner, once (§11.6.5); tell them the move is coming. The
+  reverse direction, CA to private, is the change every user must accept, on
+  purpose.
 
 Operators who would rather keep a CA have two answers that need no client
 at all and belong in the self-host instructions: DNS-01 (issuance against a
@@ -5015,17 +5084,29 @@ of the path entirely, and the first-use notice of §11.6.5, which says out
 loud that a pin was just taken.
 
 What holds regardless of who terminates TLS is everything §13.1 attributes
-to E2EE. An impostor island is a hostile island: it sees what any island
-sees, the metadata of §13.1 and every sealed envelope, and it holds whatever
-bearer token the client presents on that connection (§2.5) for as long as
-that token lives. It reads no message body, because nothing that opens an
-envelope ever crosses the wire. Its powers are a compromised backend's
-powers over that account and not one more.
+to E2EE, for every session whose peer keys this device already held. An
+impostor island is a hostile island: it sees what any island sees, the
+metadata of §13.1 and every sealed envelope, and it holds whatever bearer
+token the client presents on that connection (§2.5) for as long as that
+token lives. It reads no body of an EXISTING session, because nothing that
+opens an envelope ever crosses the wire. A contact made for the first time
+THROUGH it is different: the impostor serves that peer's `identity_key` and
+prekey bundle (§3.1, §5.3), so it can serve its own, and the bodies sealed
+to those keys it reads; an account REGISTERED through it has its own
+published keys at the impostor's mercy, and every conversation with them.
+Only comparing safety numbers out of band catches either, which is exactly
+what §13.1 says of a compromised backend. Its powers are a compromised
+backend's powers over that account and not one more.
 
 What the rule defends fully is every contact AFTER the first. An attacker
 who takes the path to an island this device already knows, by CA or by pin,
 gets `REFUSE(changed)` and nothing else: no request, no token and no
 envelope cross that connection until a person reads the banner and chooses.
+The one attacker that sentence does not cover holds a certificate the
+platform trusts for that very address, and was never in this section's
+scope: a `ca` island accepts it as it always has, and a first-use or
+accepted pin moves to `ca` under it (§11.6.6). A TYPED pin refuses it
+(§11.6.1), which is what the typed form is for.
 
 ## 12. Error Codes & Rate Limits
 
@@ -5488,7 +5569,7 @@ implementation already does) may go straight to PR.
 
 ### 15.2 Versioning
 
-This document is **v1.16**. The protocol wire major is still v1;
+This document is **v1.17**. The protocol wire major is still v1;
 the `.x` suffix tracks doc revisions. Wire-breaking changes would
 bump the major. Additive endpoints, new optional fields, and new
 envelope types do not require a major bump; they are recorded in
@@ -5527,4 +5608,6 @@ rather than a field (§9.4.7), and a spec version cannot enforce that. Read
 | v1.13   | 2026-08-30 | **The voluntary catalog and the member-only avatar pair** (§6.4.2). `GET /groups/search` matches CATALOG rows only, `in_catalog = true`, set through `PATCH /groups/{id}` by an admin or the owner (the `info` gate, since publishing a name is metadata in the same sense as the name); new rooms start unlisted, and a room is searchable because its owner listed it and for no other reason. Exact-id lookup and the preview stay unfiltered: there the link is the capability. The avatar pair (`avatar_media_id` + `avatar_media_key`) is served to MEMBERS only and never on a search row: the key is the blob's cleartext AES key and `GET /media/{id}` is unauthenticated, so the pair is the picture. Additive; an old client that searches sees fewer rows and nothing breaks. Stamped without a row on the day; backfilled in v1.16. |
 | v1.14   | 2026-08-30 | **The sealed room identity write** (§6.4.2, stage 6 phase 2, `rcq-docs/group-state-seal-design.md`). `PATCH /groups/{id}/state` with `{state_blob, state_ver}`, owner-or-`info`, 64 KB; `state_ver` must be exactly the stored version plus one, else 409 carrying the version the island holds, the vault's #605 rule at room scale. The blob is `[0x02][key_ver u32][nonce 12][AES-256-GCM ct]` over raw-deflated JSON under the room state key (RSK), which the island never sees: members receive it as a sealed 1:1 `gskey {gid, ver, key}` envelope, a joiner by link reads it from the URL FRAGMENT (`#k=`), and recovery asks any member with `gsknack`. `GET /groups*` serves `state_blob` + `state_ver` to members beside the open fields, and a client holding the key prefers the blob on read. Listed rooms keep name and description in the open on purpose. The open `key_ver` prefix landed the same day without a stamp of its own. Additive. Backfilled in v1.16. |
 | v1.15   | 2026-08-30 | **The anti-spam age floor and the `sknack` budget** (§6.4.2). `min_account_age_hours`, owner only, one of {0, 1, 6, 24, 72, 168, 720}: a member whose ACCOUNT is younger than that may read but not post a `message`; reactions, reads and control envelopes are unaffected. Enforced by the island on both group send paths for AUTHENTICATED senders, the same phase-1 shape as `owner_only` and slowmode, so an anonymous sealed post stays on the client gate; the owner, admins and any cap holder are exempt, and a cross-island guest has no local `users` row to date and is admitted. Violation is `403 {code: "account_too_young", hours_left: n}`. `sknack` sender-key recovery asks are limited to 10 per hour per account, since one ask fans a sealed payload to every capable member. Additive. Backfilled in v1.16. |
-| v1.16   | 2026-09-02 | **Island trust without a certificate authority** (new §11.6). A client trusts an island one of two ways: through the platform trust store as before, or, when the platform refuses the chain, by the SHA-256 of the DER leaf, pinned on the device the way an SSH host key is. The rule in full (§11.6.1): a CA-valid chain is accepted and writes a `ca` record even over a pin, so a Let's Encrypt renewal never warns and an island that moves to a CA needs nothing from its users; an unknown host with a private certificate is accepted on first use and said out loud once; a pinned host whose leaf changed, or a CA host now showing a private certificate, is NOT connected to at all until a person accepts the new fingerprint from a banner. The CA-only list, `api.rcq.app`, the front and everything under `rcq.app`, is never trusted on first use (§11.6.2). The canonical, accepted and display forms of the fingerprint, and why it is the leaf and not the SPKI (§11.6.3); the `host[:port]#fp` fragment every address form takes, which pins BEFORE the first connection and turns a mismatch into a refusal, and the device-scoped `host:port` store (§11.6.4); the four outcomes and what each one shows, and why a browser is left out (§11.6.5); what an island must do, a long-lived leaf with the address in the SAN, and why the CLI alone needs the SAN (§11.6.6); and the residual risk written down rather than claimed away: a first contact on a hostile network pins the attacker, and an impostor island is a hostile island with a hostile island's powers and no more (§11.6.7). No byte on the wire changes and `/server/info` deliberately does not carry the fingerprint. **`links_allowed` and `files_allowed` documented** (§6.4.3, §6.4.2, new §6.4.9): two owner-only booleans have lived on the island since 2026-08-21 and this document had no words for them. They are the first group rules the island CANNOT enforce, since it cannot see inside a sealed envelope, so they are house rules the clients keep on the owner's behalf and never a security boundary. `files_allowed = false` blocks documents, photos and videos and not voice notes, the rule decided 2026-09-02; ⚠ the clients shipped on that date still gate the microphone (Android 0.160, the web) or only the document chip (iOS). Exemption is the owner, admins and any granted cap, both ways. **Corrections.** §15.2 still stamped the document v1.12, and this history stopped there while the title had been stamped v1.13, v1.14 and v1.15 on 2026-08-30 without a row each; the three rows above are backfilled from the diffs, and the reserved-number change to §2.1 of 2026-09-01 also went through unstamped. |
+| (none)  | 2026-09-01 | **Reserved numbers leave the allocator** (§2.1, §14). Went out unstamped in `9c0eb44` and is backfilled here because it changes what three paths answer. A number is reserved when it is short (six digits or fewer) or patterned (all one digit, a repeating pair or triple, the full ladder either way, four or more trailing zeros); the random allocator never returns one, `desired_uin` at registration refuses one unless the caller proves prior tenure with a signed home-island record naming it, and the free claim of §14 refuses one outright. **Collections are closed**: `/uin/quote` answers `available: false, reason: "reserved"` and `/uin/purchase` answers `403 {"code": "reserved"}` for such a number, `max_owned` is pinned to 0, and an identity holds exactly the number it answers as; `owned_uins` stays in the schema for rows from before. An operator can still grant one (`POST /admin/uin/grant`, or an invite carrying the number). Why: there are 999 three-digit numbers in existence and there will never be more. |
+| v1.16   | 2026-09-02 | **Island trust without a certificate authority** (new §11.6). A client trusts an island one of two ways: through the platform trust store as before, or, when the platform refuses the chain, by the SHA-256 of the DER leaf, pinned on the device the way an SSH host key is. The rule in full (§11.6.1): a CA-valid chain is accepted and writes a `ca` record even over a pin, so a Let's Encrypt renewal never warns and an island that moves to a CA needs nothing from its users; an unknown host with a private certificate is accepted on first use and said out loud once; a pinned host whose leaf changed, or a CA host now showing a private certificate, is NOT connected to at all until a person accepts the new fingerprint from a banner. The CA-only list, `api.rcq.app`, the front and everything under `rcq.app`, is never trusted on first use (§11.6.2). The canonical, accepted and display forms of the fingerprint, and why it is the leaf and not the SPKI (§11.6.3); the `host[:port]#fp` fragment every address form takes, which pins BEFORE the first connection and turns a mismatch into a refusal, and the device-scoped `host:port` store (§11.6.4); the four outcomes and what each one shows, and why a browser is left out (§11.6.5); what an island must do, a long-lived leaf with the address in the SAN, and why the CLI alone needs the SAN (§11.6.6); and the residual risk written down rather than claimed away: a first contact on a hostile network pins the attacker, and an impostor island is a hostile island with a hostile island's powers and no more (§11.6.7). No byte on the wire changes and `/server/info` deliberately does not carry the fingerprint. **`links_allowed` and `files_allowed` documented** (§6.4.3, §6.4.2, new §6.4.9): two owner-only booleans have lived on the island since 2026-08-21 and this document had no words for them. They are the first group rules the island CANNOT enforce, since it cannot see inside a sealed envelope, so they are house rules the clients keep on the owner's behalf and never a security boundary. `files_allowed = false` blocks documents, photos and videos and not voice notes, the rule decided 2026-09-02; ⚠ the clients shipped on that date still gate the microphone (Android 0.160, the web) or only the document chip (iOS). Exemption is the owner, admins and any granted cap, both ways. **Corrections.** §15.2 still stamped the document v1.12, and this history stopped there while the title had been stamped v1.13, v1.14 and v1.15 on 2026-08-30 without a row each; the three rows above are backfilled from the diffs, and so is the unstamped 2026-09-01 row. |
+| v1.17   | 2026-09-02 | **§11.6 tightened after review, the same evening.** Five changes to the rule of §11.6.1 and its surroundings, none of them on the wire. (1) A TYPED fingerprint wins over an authority: a chain that does not hash to the value the person entered is `REFUSE(changed)` even when the platform trusts it, where v1.16 let any CA-valid chain overwrite the typed pin silently, so the "careful path" of §11.6.4 promised what the rule did not give; accepting that banner records `ca` (§11.6.5), and §11.6.6 now says a move to a CA is silent for first-use and accepted pins and one banner for typed ones. (2) `caValid` is defined as chain AND name for the dialled host, since a chain validator that ignores the name (Android's) would have let a captive portal's certificate write `ca` over a pin. (3) The rule runs on BOTH outcomes of platform validation on every client, and the text says why: without the `ca` write on success there is no `ca` record, and a known CA island is an unknown island to an attacker's self-signed certificate. (4) A fragment against a record that disagrees is `REFUSE(changed)` with a banner, never a silent write, and a fragment that is not 64 hex is an address error with no connection (§11.6.4). (5) A refusal is not a blocked route: the client does not engage relays or a front, retry, or report censorship on it, and a probe answers reachable / refused / unreachable (§11.6.1, §11.6.5). §11.6.7 corrects an overclaim: an impostor island reads no body of an EXISTING session, but a first contact or a registration made through it rests on safety numbers, as against a compromised backend. **§6.4.9**: a `.rcq` site address joins the set `links_allowed = false` blocks, which the renderers already honoured while the send gates did not. **§15.3**: the 2026-09-01 reserved-number change gets its own row. |
