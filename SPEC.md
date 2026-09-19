@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.17)
+# RCQ Protocol Specification (v1.18)
 
 ## 0. Status & Scope
 
@@ -15,7 +15,11 @@ In scope:
 - Contact graph (requests, accept/reject, block, mutual removal).
 - libsignal v2 key bundle publication and prekey fetch.
 - Sealed-sender 1:1 envelope routing and offline queue.
-- Per-recipient group fanout, group membership, group settings.
+- Per-recipient group fanout, group membership, group settings, and the
+  one-log-per-room receive path that replaces the per-member copy.
+- Guest copies: an account whose owner lives on another island holding a
+  seat in a room here, and the restriction set that goes with it.
+- The closed-island key door and the guest cards that open it.
 - WebSocket channel (presence, typing, reactions, call signalling).
 - APNs push (alert + VoIP), including the Notification Service
   Extension flow, and UnifiedPush for Android (no FCM).
@@ -43,14 +47,19 @@ Out of scope:
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1.17**. Last updated: **2026-09-02**. Spec maintainer:
+Version: **v1.18**. Last updated: **2026-09-19**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 
 ⚠ **Known gaps.** The endpoint census below was taken on 2026-08-16 against
 the live server's 149 paths and has NOT been retaken; for v1.8 only the paths
 this revision touches were re-checked. Most of the ones absent here are absent
-on purpose (everything under "Out of scope" above, plus federation, which lives
-in `federation-protocol.md`). Of the eighteen IN-SCOPE endpoints that census
+on purpose (everything under "Out of scope" above, plus federation). ⚠ **The
+federation protocol document is not published.** Earlier revisions of this
+spec pointed at `federation-protocol.md` in four places as though a reader
+could go and look it up; it exists only in a repository that is not public, so
+every one of those pointers was a dead end. They have been replaced with this
+sentence. Where this document needs a federation fact it now states it
+outright or marks it as unspecified here. Of the eighteen IN-SCOPE endpoints that census
 found undocumented, all but the six below were written up the same day:
 multi-device (§2.9, §2.11), registration proof (§2.8), key rotation (§2.10),
 capability negotiation (§2.12), server info (§2.13), outgoing contact requests
@@ -70,6 +79,24 @@ path census does not count: `cls`, `ring`, `to_device_id` and `seq` on the
 messaging path (§6.1.1, §6.2.1.1, §6.2.3, §6.3.1.3), sealed-payload padding
 (§6.1.2), the device key slots with their revoke cooldown and prekey
 replenish (§5.6.1 to §5.6.5), and the session denylist (§2.11.1).
+
+v1.18 closed the gaps an audit against `rcq-server-ref` found on 2026-09-19,
+and the document had fallen further behind than a path census shows, because
+most of what was missing was FIELDS and BEHAVIOUR on paths the document
+already names: fourteen keys on `GET /server/info` (§2.13), six request fields
+and one response field on `POST /auth/register` (§2.2), the whole room receive
+path behind a capability the spec listed but never specified (§6.3.3), and the
+closed-island key door that changes what a documented `404` means (§5.3,
+§5.7). Four endpoints that did not exist here at all were written up:
+`POST /residency/redeem` and `DELETE /invites/{invite_id}` (§2.16),
+`POST /users/lookup` (§4.10), and `/entry/payout-target` in the out-of-scope
+index (§14). Guest copies and guest cards are new sections (§2.15, §5.8).
+
+Still undocumented after this pass, and named here so the next reader does not
+have to find them again: the six small paths above;
+`DELETE /contacts/pending/{request_id}`, which is
+named by the `contact_pending_withdraw` capability in §2.13 and specified
+nowhere; and the federation protocol, which has no published document at all.
 
 Reproduce the list with `GET /openapi.json` and grep this file for each
 path. Do that before claiming the spec is current.
@@ -198,25 +225,78 @@ single-use code is burnt, and nothing tells them.
 
 Creates a new account.
 
-Request:
+Request (`RegisterIn`, `routers/auth.py:156`):
 
 ```json
 {
-  "nickname": "<string, 1..64 chars>",
+  "nickname":     "<string, 1..64 chars>",
   "identity_key": "<base64 of 32-byte raw X25519 public key>",
   "signing_key":  "<base64 of 32-byte raw Ed25519 public key>",
-  "inviter_uin":  <int|null>   // optional referral code
+  "inviter_uin":  <int|null>,     // whose link brought this install here
+  "invite":       "<string|null>", // invite token OR entry voucher, one box
+  "desired_uin":  <int|null>,     // best-effort, multihoming (§5a)
+  "home_record":  <object|null>,  // signed home-island record proving tenure
+  "device_id":    "<string|null>", // stable per-INSTALL id, max 64 chars
+  "challenge":    "<string|null>", // from POST /auth/register/challenge (§2.8)
+  "signature":    "<base64|null>"  // Ed25519 over `challenge`, by `signing_key`
 }
 ```
 
-Response (`201 Created`):
+Both keys are validated before anything is minted: base64 of exactly **32
+decoded bytes**, padded or unpadded, else `422` (`_pubkey32`,
+`routers/auth.py:98`). An account exists on the flagship whose `identity_key`
+is the single character `x`, registered before that check and unreachable
+forever, which is what the check exists to stop.
+
+⚠ **`invite` is one box for two different credentials**, deliberately. A
+server-join invite and a paid ENTRY VOUCHER answer the same question — may
+this person have an account here — and every client already has one field for
+that answer. The island tries the string as a voucher FIRST and only when it
+looks like one, so a plain invite never pays for a signature check
+(`routers/auth.py:444`). The voucher is redeemed **whenever one is presented
+and verifies, even on an island whose door is open**: money has already
+changed hands, and taking it without recording anything would leave somebody
+who paid with `resident_since` NULL for ever. The POLICY decides only whether
+a credential is REQUIRED (`routers/auth.py:472`).
+
+`challenge` + `signature` prove possession of the private half of
+`signing_key` (§2.8). Optional on the wire, because clients that predate the
+proof are in people's hands, and REQUIRED for the two cases where its absence
+is what an attack needs: a `signing_key` already claimed by an existing
+account (`403 {"code": "key_proof_required"}`, `routers/auth.py:392`), and
+`desired_uin` — which is honoured only under a proof (`routers/auth.py:610`).
+
+`desired_uin` is best-effort and never an error: granted only when the number
+is free in all three tables (§2.1) and, if it is a RESERVED number, only when
+`home_record` or a record this island already mirrors proves the caller
+already answers to it elsewhere (`_owns_uin_elsewhere`, `routers/auth.py:213`).
+Otherwise a fresh number is minted and nothing says so.
+
+Response (`201 Created`, `RegisterOut`, `routers/auth.py:196`):
 
 ```json
 {
   "uin":   <int>,           // freshly allocated
-  "token": "<JWT>"          // bearer token for subsequent requests
+  "token": "<JWT>",         // bearer token for subsequent requests
+  "guest": <bool>           // default false
 }
 ```
+
+`guest` is `true` when the account this token opens is a guest copy (§2.15),
+which happens on this endpoint only in one case: a PROVEN key that already
+holds a guest row here becomes that row rather than a second account
+(`routers/auth.py:516`, and the conversion at `_convert_guest_on_register`,
+`routers/auth.py:720`). `RefreshOut` (§2.14) inherits the field, and
+`/auth/recover` carries it too. A client that sees it on its own primary
+session hides contacts, calls and the rest, and must never adopt the island as
+a backup home on the strength of such a reply.
+
+**Registration policy.** `capabilities.registration_policy` (§2.13) takes
+three values, not two: `open`, `invite`, and `paid`
+(`services/server_settings.py:165`). Under `invite` and `paid` a credential is
+required; a voucher satisfies both, and an invite satisfies `paid` too,
+because that is how an operator lets somebody in without charging them
+(`routers/auth.py:472`). The refusal codes are in §12.1.
 
 Side effects:
 
@@ -224,20 +304,31 @@ Side effects:
   `signing_key` set and all libsignal v=2 fields NULL (the
   client is expected to call `POST /keys/bundle` immediately
   after `/auth/register` to upload its libsignal bundle).
-- If `RCQ_FOUNDER_UIN` is configured and exists as a non-fake
-  user, two `Contact` rows are inserted (mutual link to the
-  founder).
+- `entered_via` is stamped on EVERY registration — `"voucher"`, `"invite"` or
+  `"open"` — including on an open island, because NULL in that column means
+  "registered before the column existed" and the resident invite drip reads it
+  that way (`routers/auth.py:433`).
+- A redeemed VOUCHER additionally stamps `resident_since` and grants the
+  `resident` badge (`routers/auth.py:631`, `:645`). An invite does not: they were let
+  in, they did not buy their way in.
+- If `RCQ_FOUNDER_UIN` is configured and the account exists, mutual contact
+  edges are written to the founder (`routers/auth.py:670`).
 - If `RCQ_FOUNDER_BETA_GROUP_ID` is configured and the group
   exists, the new account is added as a `member` and a
   `group_membership_changed` WS event is fanned out to existing
   members.
-- A starter pack (currency + 3 random items) is granted via
-  internal service; this is a business detail, not a protocol
-  invariant. A failure here does not roll back the account.
-- If `inviter_uin` is set, a referral row is recorded if and
-  only if the inviter is a real user other than self and the
-  account has not already been referred. Invalid inviters are
-  silently ignored.
+- If `inviter_uin` is set and names a live, unsuspended account other than
+  self, the two are made **mutual contacts** and nothing else is recorded
+  (`_connect_inviter`, `routers/auth.py:125`). A bad value is rolled back and
+  ignored: an invalid code must never block a registration.
+
+⚠ Two things this endpoint used to do and does not. There is **no starter
+pack**: the currency-plus-three-items grant went with the 2026-05-27 pivot
+(§14.1). There is **no referral row**: `routers/referrals.record_referral`
+wrote an inviter→invitee genealogy with signup and activation dates that
+survived a UIN migration, backing a reward pipeline that was never built, and
+it was deleted on 2026-08-22. The half that does something for the user — the
+two contact edges — is all that is left.
 
 Note: `register` does NOT take a password. The JWT returned in
 the response is the only credential the client gets back; if the
@@ -613,9 +704,24 @@ agree on it:
 | `hood`, `stories`, `nearby`, `polls` | permissive (`true`) | Same rule, and for a deleted surface (§14.2) the rule is the trap. All four are on the wire as a permanent `false` rather than dropped, because dropping a key says "this island is old and still runs it". Nearby was dropped for a few hours instead of pinned, and tapping it asked for the location permission FIRST, then 404'd, and told the person their GPS had failed. A removed feature keeps answering `false` for as long as any shipped client still asks. |
 | `uin_shop`, `hall_of_fame`, `deposit_auth` | `false` | These are surfaces that exist on the flagship and on nothing else. Offering them on an island that never heard of them renders a shop and a wall of fame with no endpoints behind them. |
 | `envelope_class` | `false` | §6.2.4 says what it promises and why its default has to run this way. |
-| `anon_keys`, `group_log`, `vault` (with `vault_max_blob_bytes`, `vault_max_slots`) | `false` | Each says the island runs a stage of the core-metadata plan (anonymous key lookups; one log per room, `/messages/group-log/*`; the vault of §4.9). An island that has not said so is asked the old way, never the new one: a wrong guess there is a silenced room or an unreadable list, not a 404. |
+| `anon_keys`, `group_log`, `vault` (with `vault_max_blob_bytes`, `vault_max_slots`) | `false` | Each says the island runs a stage of the core-metadata plan (anonymous key lookups; one log per room, `/messages/group-log/*` (§6.3.3); the vault of §4.9). An island that has not said so is asked the old way, never the new one: a wrong guess there is a silenced room or an unreadable list, not a 404. |
 | `media_max_blob_bytes` | "did not say", so the client keeps its own default | NEW in v1.11. An integer, the island's `/media` blob ceiling in bytes (§9.1). Purely informational: nothing about `POST /media/upload` or `PUT /media/{id}` changes, and the island still enforces the cap while reading the body. It exists so a client can refuse an oversize video in the composer rather than at byte 536,870,913 of an upload the person has watched for twenty minutes. Absent, or `0`, is not "no limit" and not "unlimited": it is an island that predates the field, and a client falls back to its own guess (512 MB on Android, which is what every RCQ island has shipped with). |
+| `closed_island` | `false` | NEW in v1.18. The island withholds from a non-resident everything that DESCRIBES a resident, while still handing out the keys an envelope is sealed with (§5.7). Published because the refusal itself deliberately cannot say so: it is byte for byte the `404 "no such user"` a number that does not exist gets, or a closed island becomes a directory for guessing which numbers exist. The client is the only thing that can tell a person "this island is closed, you need a link from them", and it can only do that if it was told in advance. `routers/server.py:64`, set from the operator's `closed_island` setting at `routers/server.py:426`. |
+| `cross_island` | `true` | NEW in v1.18. Whether somebody on ANOTHER island may start a conversation with a resident here. A closed island still answers `true`: it withholds every word that describes a resident and still serves the seal keys, because without them it is not on the network at all. It answers `false` only when the operator ALSO sets `federation_refuse_strangers`, and then `GET /federation/keys/{uin}` refuses with `403 "island_closed"` (§5.7) and the client can say so instead of drawing a failure it cannot explain. `routers/server.py:73`, computed at `routers/server.py:437`. |
+| `anon_keys` on a closed island | see the row above | The served value is `not (closed_island and federation_refuse_strangers)` (`routers/server.py:433`), the same expression as `cross_island`. ⚠ The comment on the field says the flag is turned off on a closed island; the expression is what runs, and a closed island that has not asked to refuse strangers still advertises `anon_keys: true`. |
+| `entry_price_cents` | `0` | NEW in v1.18. What this island charges to join, in US cents; `0` is "not sold". Published so a person sees the price in the picker BEFORE they are refused at the door rather than after. ⚠ Published whenever entry is for sale and NOT only when the door is locked: an island can sell residency while still letting anybody in free. `routers/server.py:77`, `:452`. |
+| `entry_url` | `""` | NEW in v1.18. A page where entry is bought, when the operator names one. Never rendered on iOS: Apple does not allow an app to point at a purchase it does not handle. `routers/server.py:81`, `:453`. |
+| `till_url` | `""` | NEW in v1.18. This island's own checkout worker, and the ONLY thing that makes a client draw the in-app entry gateway — there is no compiled-in fallback for entry on any platform. **https only**: a value with any other scheme is served as `""` (`_https_only`, `routers/server.py:357`). It is the same `uin_till_url` setting that sells numbers, so one till serves numbers, resale and entry. `routers/server.py:96`, `:454`. |
+| `terms_url` | `""` | NEW in v1.18. The operator's own terms-of-sale and refund page, when they name one; `http` is tolerated here because it is a link and not a payment path (`_http_or_https`, `routers/server.py:366`). A client that sells entry in-app links it beside the payment, because on a self-hosted island the OPERATOR is the seller and their terms apply. Empty means the client says instead that refunds are the operator's decision. `routers/server.py:105`, `:456`. |
+| `user_count` | `0` | NEW in v1.18. How many accounts live here, so an island card can say it beside the price. Counted at most once a minute and cached (`routers/server.py:382`), and guest copies (§2.15) are excluded, so a busy open room cannot inflate it. `0` means "not published" — an island older than the field, or the window after a restart before the first count — and a client draws nothing rather than claiming an island is empty. `routers/server.py:119`, `:457`. |
+| `max_accounts_per_device` | the client's own cap | NEW in v1.18. How many accounts one device may hold; the reference island serves `5` (`routers/server.py:161`, operator setting `max_accounts_per_device`, `:460`). Advisory only — the island cannot see which accounts share a device — and clients cap the account switcher with it. |
+| `users_lookup` | `false` | NEW in v1.18. The island understands the per-install `vault_contacts` capability of §2.12 and serves `POST /users/lookup` (§4.10). Absent, a client keeps turning its numbers into rows the old way, through `GET /contacts`. Permanent capability of this codebase, always `true` here (`routers/server.py:213`). |
+| `contacts_readonly` | `false` | NEW in v1.18. When `true`, the island's own `contacts` rows are no longer the truth and a client reads its list out of its vault slot (§4.9). It is `false` on this codebase (`routers/server.py:223`) and a client MUST keep treating `GET /contacts` as a live list while it is: the island still writes both directed rows for every accepted pair, because five server-side rules (calls, room invites, presence, `last_seen`, the picture) still read them. |
+| `contact_pending_withdraw` | **`false`** — no withdraw | NEW in v1.18. `DELETE /contacts/pending/{request_id}` (`routers/contacts.py:583`, not otherwise specified in this document): the ADDRESSEE clears a pending request without answering it. ⚠ This is the one key whose permissive reading is the wrong one. A client talking to an island that omits it must hide the row locally and must NOT decline instead: a decline is an answer the requester sees and keeps for 180 days, a withdraw is not. Permanent capability of this codebase, `true` here (`routers/server.py:234`). |
+| `guest_accounts_v1` | `false` | NEW in v1.18. The four guest endpoints of §2.15 exist AND this island admits NEW guests right now. ⚠ Not a permanent property of the codebase like `envelope_class`: it follows the operator's settings through `guest_policy.admission_open()` (`routers/server.py:455`), so an open island, an invite-only or closed island left on `auto`, and an island that pulled the brake all say `false`, and a client on any of them behaves exactly as it did before guests existed. The restrictions an EXISTING guest lives under do not depend on it. |
+| `reissue_proof_v1` | `false` | NEW in v1.18. `POST /auth/reissue` (§2.10) understands the optional `rcq-reissue-v1` proof, `/auth/refresh` and `/auth/recover` answer `identity_rotated` for a retired key, and a signed key change bumps the account's token epoch. ⚠ A client starts a rotation ONLY on a home island that advertises this: an island without it takes the new keys and then answers the account's other devices `identity_not_found`, which older clients read as a burn and wipe on. Permanent capability of this codebase, `true` here (`routers/server.py:257`). Whether the proof is REQUIRED is the separate operator setting `reissue_require_proof`. |
 | `logo_version` (⚠ top level, beside `name` and `welcome`, NOT inside `capabilities`) | `""`, so the client draws its lettered tile | NEW in v1.12. A short opaque digest of the island's LOGO, or `""` when its operator has not set one. It sits with the other two things an island says about ITSELF rather than among the flags, because it is identity and not a feature switch. It is not the picture and it is not a URL: the picture is one unauthenticated `GET /server/logo` (§2.13.1) and the client builds that URL itself from the host it is already talking to. Both halves of that are deliberate. This reply is read on every connect, for every account, and by the cross-island paths against islands a client merely PROBES, so a data URI here would put an image on all of those every time and could not be revalidated separately from the flags. And a URL would let any island, including one the caller has no account on, name a third-party host and be handed the caller's IP; an island only ever gets to say WHETHER it has a logo and WHICH one. Absent means an island older than the field, which reads the same as no logo. |
+| `badges` (⚠ top level, beside `name`, `welcome` and `logo_version`, NOT inside `capabilities`) | `{}`, so the client uses its own words | NEW in v1.18. The island's own words for its badges, keyed by kind: `{"<kind>": {"label": "<string>", "description": "<string>", "color": "<hex>"}}`. Public and unauthenticated on purpose, because a client draws a badge on a stranger's card and in a room's member list, both of which happen before it has anything to do with this island. The kinds are an OPEN dictionary, so an island can mint `resident` or `founder` and name it without four client releases; a client that has never heard of a slug renders whatever is here, and falls back to a plain mark when the entry is empty. A kind is accepted only if it matches `^[a-z][a-z0-9_-]{0,15}$`; `label` is cut to 64 characters, `description` to 280, `color` to 16. An operator's value that will not parse is dropped rather than failing the reply, so a typo in one badge cannot blank the island's name (`_badge_texts`, `routers/server.py:324`). Model at `routers/server.py:316`, served at `:416`. |
 
 ⚠ On iOS `uin_shop` is a hard decode: an answer without the key fails the whole
 capability decode and the client keeps the set it already had, rather than
@@ -690,11 +796,30 @@ POST /auth/refresh
     "signature":   "<base64 Ed25519 signature over the challenge string>",
     "device_id":   "<optional: the install asking>"
   }
-→ { "uin": <int>, "token": "<JWT>" }
+→ {
+    "uin":        <int>,
+    "token":      "<JWT>",
+    "moved_from": <int|null>,   // the number asked for, when the account moved
+    "guest":      <bool>        // default false; see §2.15
+  }
 ```
 
+`RefreshOut` extends `RegisterOut` (`routers/auth.py:1045`), so `guest` means
+here exactly what it means in §2.2: the account this token opens is a guest
+copy. A proof of the signing key also CLAIMS an unclaimed seat on the way
+through, which is why an owner-added person can arrive by this door
+(`_claim_seat_on_proof`, `routers/auth.py:990`).
+
 Errors: `400 invalid_challenge`, `401 bad_signature`,
-`404 identity_not_found`. Rate limit: 60 per hour per caller.
+`404 identity_not_found`. Two more, and they exist because
+`identity_not_found` is the word every client wipes on:
+`404 {"code": "identity_rotated", "uin": <int>}` when this island retired the
+key in a rotation and the account is alive under its current number
+(`routers/auth.py:1150`), and `404 {"code": "identity_ambiguous"}` when the
+number asked for is vacant and the key answers for more than one account, so
+the island will not pick a winner (`routers/auth.py:1156`). A client that
+meets either must hold still and send its owner to recovery rather than erase
+anything. Rate limit: 60 per hour per caller.
 
 **Why it is not §2.7.** `/auth/recover` resolves a signing key to the
 OLDEST account carrying it — the right rule for "I lost my device, take me
@@ -720,12 +845,382 @@ If `device_id` names an install with no queue cursor, one is created at the
 account watermark — never at zero, or the next drain replays the entire
 queue as notifications (the 2026-08-13 drain-floor bug).
 
+### 2.15 Guest copies
+
+Shipped 2026-09-15. A **guest copy** is an account row on this island whose
+owner lives on another one, holding a seat in a room here without having come
+through the door. The row carries `users.guest_status`, which is `"added"` for
+a seat nobody has claimed, `"proven"` for a copy whose key has been proven, and
+NULL for every native account (`core/guest_policy.py`). Nothing about the
+person's home island is sent or stored: no home host, no home UIN.
+
+Four endpoints, and a restriction set that a client MUST know about, because a
+client that does not will draw buttons that always fail (§2.15.5).
+
+⚠ Gate every one of these on `capabilities.guest_accounts_v1` (§2.13). It is
+not a permanent property of the codebase: it follows the operator's settings,
+so an open island answers `false` (anyone may register there and "guest" means
+nothing), and so does an island whose operator pulled the brake. Absent or
+`false`, a client uses the legacy recover-first / register path.
+
+⚠ Guest copies are a different feature from the **guest cards** of §5.8, which
+are older, and the two are only related by the word. A card is a credential a
+RESIDENT hands out so a stranger can fetch their key on a closed island. A
+guest copy is an ACCOUNT.
+
+#### 2.15.1 `POST /auth/guest/challenge`
+
+```
+POST /auth/guest/challenge   { "signing_key": "<base64 Ed25519 pub>" }
+→ 200 { "challenge": "<opaque string>" }
+```
+
+A 120-second challenge bound to `typ="guest"` and to the key exactly as sent
+(`routers/auth.py:1701`, `core/security.py:142`). The `typ` keeps it apart
+from the register (§2.8) and recover (§2.7) challenges **in both directions**:
+neither of those is accepted here, and this one is accepted nowhere else. It
+says nothing about whether the key or any account exists, so it cannot be used
+to probe for either. Rate limits: 60/hour per caller and 240/hour per /24 or
+/64, both fail-closed (§12.2).
+
+#### 2.15.2 `POST /auth/guest`
+
+The copy and its first membership, in one request.
+
+Request (`GuestIn`, `routers/auth.py:1716`):
+
+```json
+{
+  "v":            1,
+  "host":         "<the island as the client dialled it>",
+  "group_id":     <int>,
+  "nickname":     "<string, 1..64 chars>",
+  "identity_key": "<base64 of 32-byte raw X25519 public key>",
+  "signing_key":  "<base64 of 32-byte raw Ed25519 public key>",
+  "challenge":    "<from /auth/guest/challenge>",
+  "signature":    "<base64 Ed25519 over the proof bytes below>",
+  "device_id":    "<string|null>"
+}
+```
+
+Response (`201 Created` on a new row, `200 OK` on an existing one):
+
+```json
+{ "uin": <int>, "token": "<JWT>", "guest": <bool>, "created": <bool> }
+```
+
+`created` is true only when this request minted the row. `guest` is false in
+exactly one case: the key resolved to a NATIVE account here (a backup home, or
+a copy that settled while the door was open), and the caller gets that
+account, unrestricted (`routers/auth.py:1953`).
+
+**The proof** is `rcq-guest-v1` (`services/guest_proof.py`): UTF-8, six fields
+joined by a single `\n` with no trailing newline, signed by the private half of
+`signing_key`.
+
+```
+rcq-guest-v1
+<host>          canonical: lowercase, ":port" only when it is not 443
+<group_id>      decimal ASCII, no sign, no leading zeros
+<identity_key>  standard PADDED base64 of the 32 X25519 bytes
+<signing_key>   standard PADDED base64 of the 32 Ed25519 bytes
+<challenge>     verbatim, exactly as the island handed it over
+```
+
+★ Why each field is in there. The island can check only that the caller holds
+the private half of the key the copy will carry, so the signature has to pin
+down everything a relay, a front or a replaying stranger could otherwise
+change. The **host** stops a proof made for island A minting a copy on island
+C — which matters most between islands still running the default JWT secret,
+since they accept each other's challenges. The **room** stops a relaying front
+moving somebody into a room they did not tap. The **identity key** is covered
+here and is NOT covered by the register proof of §2.8, which signs the
+challenge string alone, so without it anybody in the middle could pin an `ik`
+of their choosing to somebody else's signing key. ⚠ The island never signs or
+verifies the strings it was sent: keys are decoded and re-encoded as standard
+padded base64 and the host is canonicalised before the bytes are rebuilt. Only
+the challenge goes in verbatim, because it is the island's own token and the
+client must sign exactly what it was handed.
+
+**The order of the checks is the design** (`guest_join`, `routers/auth.py:1766`): everything
+refusable without state first, the challenge spent before any token exists,
+existing rows answered before the admission switch is read, and the room
+checked before anything is written.
+
+| # | Check | Refusal |
+|---|-------|---------|
+| 1 | `v` is the version this island knows | `400 {"code": "guest_proof_version"}` — ⚠ not a `422`, so a client from the future can tell "update the island" from "my request is broken" |
+| 1 | keys decode to 32 bytes; signature decodes | `422` on a key, `400 {"code": "guest_proof_malformed"}` on the signature |
+| 2 | a GUEST challenge for this key, unexpired | `400 {"code": "invalid_challenge"}` |
+| 3 | `host` is one of this island's own names | `400 {"code": "guest_wrong_host"}` |
+| 4 | the signature over the six fields | `401 {"code": "bad_signature"}` — a request whose `identity_key` or `group_id` was swapped after signing fails HERE, which is what it is |
+| 5 | the challenge is spent, single use | — |
+| 6 | a row already exists for this key | answered `200`, and nothing below runs |
+| 6 | the key was retired by a rotation here | `404 {"code": "identity_rotated", "uin": <int>}` — the same answer recover gives, and clients must never wipe on it |
+| 7 | this island admits NEW guests right now | `403 {"code": "guest_closed"}` |
+| 8 | the room exists | `404 {"code": "group_not_found"}` |
+| 8 | the room is not closed (§6.4.5) | `403 {"code": "group_closed"}` |
+| 8 | the room's own `allow_guests` is not false | `403 {"code": "guest_room_closed"}` |
+| 8 | the room is under the guest member ceiling | `403 {"code": "guest_room_full"}` |
+| 8 | the room's daily guest budget | `429 {"code": "guest_room_limit"}` |
+| 9 | a create lock, and the key is resolved again under it | a concurrent request for the same key is answered `200` |
+
+A `503 {"code": "guest_unavailable"}` with `Retry-After: 30` is the answer
+whenever the island cannot mark, lock or read what it needs
+(`core/guest_policy.py:148`). ⚠ That direction is deliberate and is the
+REVERSE of the suspended-account check, which fails open: a guest read as
+native for a minute is a free full account on a paid island, while a native
+read as a guest for a minute is a refused request they retry.
+
+**What a mint does NOT do** (`routers/auth.py:1899`): no founder edge, no
+inviter edge, no auto-join to the beta room. A guest has no relationships on
+this island and no rooms it did not choose.
+
+⚠ A fresh copy's `last_seen` is written **one day short of the dormant
+window**, not `now` (`guest_policy.mint_backdate`). Group content is queued
+only for members seen inside that window (§6.3.1), so a self-joined guest has
+about a day of content stored before its first poll and a script that mints
+and never polls stops costing storage after that day. An unclaimed seat
+(§2.15.4) is backdated to well PAST the window, so it stores no group content
+at all until somebody claims it.
+
+Rate limits, all fail-closed, all on their own buckets so that a flood of free
+mints cannot 429 somebody standing at the door with a paid voucher: 10/hour
+and 30/day per caller, 30/hour per subnet, plus the island's own `guest_mint`
+ceiling (§12.2).
+
+#### 2.15.3 `POST /auth/guest/settle`
+
+A guest becomes a resident of THIS row, keeping its number and its rooms.
+Authenticated with the guest's own bearer; **the token does not change**,
+because guestness is never in it.
+
+```
+POST /auth/guest/settle   { "code": "<invite or entry voucher|null>" }
+→ 200 {
+    "uin":            <int>,
+    "resident_since": "<ISO datetime|null>",
+    "badge":          "<string|null>",
+    "badges_earned":  ["<string>", ...]
+  }
+```
+
+`code` is the same one box as `invite` on §2.2 and is tried the same way: a
+voucher first and only when it looks like one, then an invite. A voucher
+stamps `resident_since` and grants the `resident` badge; an invite lets
+somebody live here without making them a resident, exactly as at registration.
+Absent `code` is allowed only on an island whose `registration_policy` is
+`open`, and the policy is read STRICTLY there — a cold worker whose database
+blinked would otherwise serve the code default `"open"` and settle a guest for
+nothing on a paid island, so the answer is `503 {"code":
+"guest_unavailable"}` instead (`routers/auth.py:2080`).
+
+Refusals: `409 {"code": "not_a_guest"}` when the caller is native already,
+`409 {"code": "invite_has_number"}` when the invite reserves a UIN — the row
+already has one, and spending the invite on it would throw away what the
+invite was for — plus the door codes of §12.1. Rate limit 10/hour,
+fail-closed.
+
+#### 2.15.4 `POST /groups/{group_id}/guests`
+
+A member puts a contact from another island into this room by their PUBLIC
+card. Replaces the legacy `uin-for-key` → `/auth/register` → `/members` chain,
+which handed the adder a full session token for somebody else's account and
+stopped at the door on a paid island.
+
+```
+POST /groups/{group_id}/guests
+  {
+    "identity_key": "<base64 32-byte X25519>",
+    "signing_key":  "<base64 32-byte Ed25519>",
+    "nickname":     "<string, 1..256, trimmed to the column's 64>"
+  }
+→ 200 <GroupOut> + { "added_uin": <int>, "created": <bool> }
+```
+
+No home host and no home UIN are sent, and the reply carries **no token and
+must never carry one**: the adder holds only public keys. The key resolves to
+the row it already has, or to a new UNCLAIMED seat minted together with its
+membership; the person claims the seat by later proving the key at
+`/auth/guest`, `/auth/recover` or `/auth/refresh` (`routers/groups.py:1484`).
+
+Refusals beyond the room rules above: `403 {"code": "guest_restricted"}` — a
+guest adds nobody, it shares the room link instead — `403 {"code":
+"guest_closed"}`, `409 {"code": "guest_key_retired"}` when the key is one this
+island retired in a rotation (a seat minted from a stale card would be
+recoverable by whoever holds the OLD seed), `403 {"code":
+"guest_group_limit"}` when the person is already in `guest_max_groups` rooms
+here, and `429 {"code": "guest_add_limit", "scope": "group"}`. The room's own
+`allow_guests: false` binds plain members but not the owner or an admin, who
+decided it (`routers/groups.py:1533`).
+
+⚠ The island-wide owner-add ceiling is charged INSIDE the handler and is
+deliberately not a route dependency. FastAPI resolves a route's dependencies
+before the endpoint's own parameters, so as a dependency it ran before the
+session was resolved: anonymous calls, guest tokens, non-members and malformed
+keys all spent the island's allowance, and about sixty addresses an hour could
+hold every legitimate owner-add at `503 island_busy`. A cap on the whole
+island may only be charged by callers who have shown they could have used it
+(`_guest_add_ceiling`, `routers/groups.py:1476`).
+
+#### 2.15.5 What a guest may do
+
+**Describe this to a client, because a client that does not know it will draw
+buttons that always fail.** The policy is a marker on every route that takes
+an account session (`core/guest_policy.py:335`), and the default is DENIED, so
+a route added next month is closed to guests until somebody decides otherwise.
+A denied route answers `403 {"code": "guest_restricted"}` before the handler
+runs; shipped clients show one sentence for it and never retry.
+
+A guest copy takes part in **rooms** and in nothing else. In particular:
+
+| Surface | What a guest gets | Where |
+|---------|-------------------|-------|
+| rooms it was let into: read, post, the room log, membership | everything a member gets | `@guest(ALLOW)` on the group and message routes |
+| joining another room **by that room's link** | allowed, under the same room rules as the mint plus a per-guest room cap | `routers/groups.py:1306` |
+| `GET /users/search`, `GET /groups/discover`, `GET /groups/search`, the number shop shelf, `GET /audio_rooms` | an EMPTY list, not a `403` | `routers/users.py:487`, `routers/groups.py:1060`, `routers/uin_shop.py:553`, `routers/audio_rooms.py:243` |
+| `POST /users/lookup` (§4.10) | an empty list | `routers/users.py:855` |
+| `GET /users/{uin}/info` | itself, and anybody it shares a room with. Anybody else is the same `404 "no such user"` a number that does not exist gets, **on an open island too**, so a free guest token is not a way to walk the numbers | `routers/users.py:989` |
+| key lookups (§5.3, §5.6.2) | sharing a room is enough; otherwise the caller is treated as ANONYMOUS and goes through the closed-island door (§5.7), a card included | `routers/keys.py:387` |
+| `POST /contacts/respond` | may DECLINE, never ACCEPT: accepting writes a relationship on this island, which is what the door sells. The person answers properly from home over §5f | `routers/contacts.py:521` |
+| 1:1 calls and `typing` | refused whenever EITHER end is a guest, before the callee's own `call_policy` is consulted. A `typing` frame and every call frame but the offer are dropped in SILENCE, exactly as an unknown kind is; a `call_offer` ends as `unavailable` at once and nothing reaches the other end. ⚠ The pair check fails CLOSED — during a total outage the frame is dropped, which costs nothing that outage has not already cost | `routers/ws.py:405`, `:429`, `:845` |
+| `POST /users/me/push-token` | `204` and **nothing stored**. A guest mailbox never wakes a phone; a `403` would be retried forever by shipped clients registering on every launch | `routers/users.py:1223` |
+| being rung or pushed at by a sender | never: a guest copy is not woken | `routers/messages.py:543` |
+| `/reports` | allowed, on a budget of 5 a day, fail-closed | `routers/reports.py:60` |
+| contacts, numbers, invites, audio rooms of its own, adding a guest | denied | the default |
+| `DELETE /auth/account`, `/vault/*`, the queue and log drains, `/auth/guest/settle` | allowed | `@guest(ALLOW)` |
+
+⚠ Two of these answer an EMPTY LIST rather than a `403`, and that is not
+laziness: shipped clients call those endpoints from a copy that is signed in
+as an ordinary account, and would surface an error the person cannot act on.
+An empty shelf is the honest rendering of "there is nothing here for you".
+
+⚠ **A guest that only polls keeps itself alive.** Group content is queued only
+for members inside the dormant window, and a copy with no socket sends no
+heartbeat, so `GET /messages/queue` and `POST /messages/group-log/fetch` stamp
+`last_seen` for a guest at most once per six hours, written one hour in the
+past so presence never reads a guest as online
+(`guest_policy.touch_poll`, `core/guest_policy.py:419`).
+
+### 2.16 Buying residency on an account that already exists
+
+#### 2.16.1 `POST /residency/redeem`
+
+Until 2026-09-12 the only way to become a resident of a paid island was to
+redeem an entry voucher AT REGISTRATION (§2.2), which left out everyone who is
+already here: they could buy a voucher and then had to register a second
+account and abandon the first, with its contacts, its rooms and its number.
+This takes the same voucher, signed by the same till for the same island, and
+applies it to the account that is asking.
+
+```
+POST /residency/redeem
+  Authorization: Bearer <JWT>
+  { "voucher": "<the entry voucher, 16..4096 chars, as the till handed it>" }
+→ 200 {
+    "resident_since": "<ISO datetime>",
+    "badge":          "<string|null>",   // what the account now WEARS
+    "badges_earned":  ["<string>", ...], // what it now HOLDS, "resident" included
+    "invites":        <InvitesOut>,      // §2.16.3, so the client redraws in one trip
+    "guest":          false              // always, see below
+  }
+```
+
+What it changes on the row and nothing else: `resident_since` is stamped with
+now; the `resident` mark is ADDED to what the account holds and worn only if
+nothing else is worn, so a tester who pays keeps showing the tester mark until
+they choose otherwise; `entered_via` is left alone, because how they got in is
+history and paying a year later does not rewrite it; the invite counter is left
+alone, because resetting it would be a free reroll.
+
+A guest copy (§2.15) that redeems is converted to a native account **in the
+same commit as the voucher**, which is why `guest` is always `false` in the
+reply and why a client holding a copy can drop its guest restrictions without a
+second request. A paid resident still restricted to rooms would be the worst of
+both.
+
+⚠⚠ **The order of the checks is the feature.** "Already a resident" is
+answered BEFORE the voucher is touched (`routers/residency.py:102`). A client
+that double-taps, or retries a request whose response was lost, sends the same
+paid code twice; if the second arrival spent the nonce first and only then
+noticed, the person would have paid twice for one thing and the island would
+hold no record of it. The nonce is claimed by INSERT with the nonce as the
+primary key, so two simultaneous redemptions cannot both succeed.
+
+Refusals: `404 "user not found"`, `403 {"code": "suspended"}` — a banned
+account buying its way back to the invite drip is a banned person letting other
+people in — `409 {"code": "already_resident"}`, `409 {"code":
+"voucher_spent"}`, `404 {"code": "sales_disabled"}` when this island has no
+till key or has not been told its own name (there is nothing here to sell), and
+the remaining voucher codes of §12.1 as `403`. Rate limit 10/hour,
+fail-closed (§12.2).
+
+Everyone holding this account as a contact is repainted at once with
+`contact_renamed` (§7.4.4), carrying the badge — and carrying `null` when the
+owner keeps the mark hidden, because paying must not be the thing that reveals
+a mark they chose not to wear.
+
+#### 2.16.2 `DELETE /invites/{invite_id}`
+
+A resident withdraws one of their OWN invites.
+
+```
+DELETE /invites/{invite_id}
+  Authorization: Bearer <JWT>
+→ 204
+→ 404 "no such invite"    // absent, or created by somebody else
+```
+
+`invite_id` is the row id as `InvitesOut.invites[].id` gives it, which is the
+**sha256-hex** of the code and not the code: the raw code is shown once, by
+the mint call, and is not recoverable (`routers/invites.py:352`). The same
+`404` covers "does not exist" and "not yours".
+
+⚠ **It does not refund the credit.** Refunding would turn "five in total" into
+an unlimited reroll: mint, look at the code, revoke, mint again. The invite
+stops working and the allowance stays spent.
+
+#### 2.16.3 `GET /invites` — what this account may hand out
+
+Returns the caller's own allowance and the codes it has minted:
+`{enabled, eligible, total, granted, used, next_at, invites: [...]}`.
+`total` is the size of the allowance, `granted` how much of it has accrued so
+far, `used` how many codes were minted. `eligible` false with `enabled` true
+means this island hands out invites but not to this account.
+
+An account draws from one of two allowances and never both
+(`routers/invites.py:206`): a RESIDENT draws the paid one, and an account that
+was here before entry went on sale draws the free drip, which additionally
+requires the row to look like a person's. The codes accrue over a period
+rather than arriving at once, which is what `next_at` reports.
+
+#### 2.16.4 `POST /invites` — mint one
+
+Spends one unit of the allowance and returns the code. The code is a bearer
+string: the island stores it, and whoever types it into `POST /auth/register`
+spends it. There is no way to look one up again after it is shown, and
+`DELETE /invites/{invite_id}` above revokes it without refunding the unit.
+
 ## 3. User Profile & Visibility
 
-### 3.1 `GET /users/me/info` and `GET /users/{uin}/info`
+### 3.1 `GET /users/{uin}/info`
 
 Returns a `PublicUser` for the requested UIN. The shape depends
 on the viewer's relationship to the target.
+
+⚠ **There is no `GET /users/me/info`, and asking for one is not a `404`.**
+This section was titled for it through v1.17 and the path never existed: the
+`/users` router carries `GET /users/{uin}/info` with an INTEGER path parameter
+(`routers/users.py:946`), so `me` fails Pydantic's path validation and the
+island answers `422`, which a client reading this document would take for a
+malformed body. **The owner path is `GET /users/{own uin}/info`**: the handler
+compares the caller against `uin` and serves the owner-self view, including
+the owner-only echoes below, when they match (`routers/users.py:997`). The
+`/users/me/*` paths that DO exist are all writes or settings —
+`PUT /users/me`, `POST /users/me/push-token`, `GET /users/me/push-health`,
+`POST /users/me/capabilities` (§2.12), `GET|PUT /users/me/push-preferences`,
+`GET /users/me/turn-credentials` (§7.5) — and none of them returns a
+`PublicUser` card except `PUT /users/me`.
 
 Always present (the cryptographic identity layer cannot be
 hidden, because senders need it to encrypt):
@@ -734,6 +1229,7 @@ hidden, because senders need it to encrypt):
 |---------------------------|-------------|--------------------------------------|
 | `uin`                     | int         |                                      |
 | `nickname`                | string      | 1..64 chars                          |
+| `badge`                   | string|null | The island's mark on this account: a kind such as `official`, `tester`, `special` or `resident`, or null. An OPEN dictionary — the island names and colours its own kinds through the top-level `badges` map of §2.13, so a client draws one it has never heard of and never needs a release to do it. ⚠ Null here is TWO different facts, no mark and a mark whose owner chose not to wear it (`badge_hidden`), and they are deliberately indistinguishable: a "hidden" signal on the wire would answer the question the setting exists to refuse. The owner's own row is the exception and always carries the real value. `routers/users.py:71`, `badge_for_viewer` at `models/user.py:556` |
 | `identity_key`            | string      | base64 X25519 pub                    |
 | `signing_key`             | string      | base64 Ed25519 pub                   |
 | `signal_identity_key`     | string|null | base64 libsignal IdentityKey; null = v=1 only |
@@ -869,9 +1365,19 @@ The `status` enum:
 "Online" is **not** trusted from a stored column. A client must
 heartbeat (see Section 7) to stay online. Definitions:
 
-- `PRESENCE_FRESHNESS_SECONDS = 60`. A user with `last_seen <
-  now - 60s` is considered offline regardless of their stored
-  `status`.
+- `PRESENCE_FRESHNESS_SECONDS = 90` (`models/user.py:458`). A user with
+  `last_seen < now - 90s` is considered offline regardless of their stored
+  `status`. ⚠ It was 60, and 60 is wrong: at a 25s heartbeat (§7.3) it cleared
+  two pings with ten seconds to spare, so ONE missed ping — a tunnel, a screen
+  off, a throttled background tab, a phone that dozed for twenty seconds —
+  made a live person read offline to everyone, and the next ping made them
+  arrive again. Nobody went anywhere and every client announced both events
+  (reports #1029 and #1030: the arrival sound fires while the contact's own
+  indicator is still green). 90 clears three pings and leaves fifteen seconds
+  for jitter. The cost is that somebody who really did close the app reads
+  online for up to half a minute longer, which is the right side to err on:
+  presence is a courtesy, and "maybe still there" is a smaller lie than "left
+  and came back" twice a minute.
 - The stored `status` is consulted only for the sub-state pick
   (`away`/`dnd`/`invisible`) and only when freshness is current.
 
@@ -1311,6 +1817,87 @@ ships first and empty; clients mirror the server list into it; the server list
 goes read-only; it drops) is the rest of stage 4 and is documented as each
 step ships.
 
+### 4.10 `POST /users/lookup`
+
+A batch of `GET /users/{uin}/info`, and deliberately nothing more. It exists
+because stage 4 (§4.9) takes the contact list off the island: when the
+`contacts` rows go, the JOIN that produces a rendered list goes with them, and
+the client is left holding a list of numbers it read out of its own vault
+slot. This turns those numbers back into rows. Capability `users_lookup` in
+§2.13.
+
+```
+POST /users/lookup
+  Authorization: Bearer <JWT>
+  { "uins": [ <int>, ... ] }     // 1..256, STRICTLY ASCENDING
+→ 200 { "users": [ <LookupRow>, ... ] }
+```
+
+`LookupRow` is exactly the `ContactRow` of §4.2 **minus `blocked`**, plus the
+fields that row has gained: `uin`, `nickname`, `badge`, `status`,
+`status_message`, `identity_key`, `signing_key`, `signal_identity_key`,
+`gender`, `last_seen`, `callable`, `profile_openable`, `avatar_media_id`,
+`avatar_media_key` (`routers/users.py:710`). ⚠ The omission of `blocked` is
+the point rather than an oversight: whether you have blocked somebody is
+yours, it lives in your vault, and an island that answers it is keeping the
+negative half of the graph after giving up the positive half.
+
+**THE RULE.** For every uin in the batch this answers exactly what `GET
+/users/{uin}/info` would answer the SAME caller: same visibility gates, same
+card gate (§3.1.1), same picture rule, evaluated per row. One round trip
+instead of N, and not a second way in — if a field is hidden from you one at a
+time, it is hidden from you here.
+
+⚠⚠ **`uins` must be strictly ascending, and the island enforces it rather
+than asking** (`_ascending`, `routers/users.py:694`; `422` otherwise). A
+client that passes its rendered list straight through sends it in DISPLAY
+order, which is most-recent-conversation first — "who this account talks to
+most", written into the request body, which is the exact fact this endpoint is
+built not to carry. The island sees the body as sent, before any code turns it
+into a set, so a SHOULD would be a property nobody enforces. Ascending also
+means no repeats.
+
+⚠ **A body and never a query string:** a uin in a URL is a uin in an access
+log, and this list is the most sensitive thing a client sends.
+
+**What the island learns, plainly.** That this account asked about these
+numbers, at this moment. That is the same SHAPE of knowledge `GET /contacts`
+handed over, and stage 4 is not honest about removing the contact graph if the
+replacement posts it back on every boot. Precisely: it is a SUPERSET of a
+contact list, not a contact list — the batch is the caller's render set, which
+is contacts, group co-members, strangers who wrote first and a number typed
+into search a minute ago; sending nothing but the contact list is a client
+choice, not something this endpoint forces. And ⚠ **padding does not hide a
+number from the ISLAND**, only from a reader of the request: the island runs
+the query, so chaff made of unknown or suspended uins falls out of its own
+answer, and only chaff naming LIVE accounts is indistinguishable from real
+interest.
+
+`callable` is a UI hint, computed the way the call gate computes it, and is
+answered honestly only for a contact — `true` for everybody else. A real
+verdict for an arbitrary uin would hand a caller up to 256 strangers'
+call settings in one request, which no other endpoint gives: `PublicUser` has
+no such field and returns `call_policy` as null to every non-self viewer. The
+ring itself is still gated server-side (§7.4.7).
+
+A guest copy (§2.15.5) gets `{"users": []}`.
+
+⚠ **On a closed island this endpoint does NOT strip key fields**, where
+`GET /users/search` does. See the note in §5.7: the per-row visibility gates
+run faithfully here, the closed-island door does not run at all, and the three
+key fields are not among the gated ones.
+
+**Limits.** 256 uins per request (a cost number, not a privacy one: the
+per-uin endpoint is capped at 180/min and 120 batches of 256 an hour is the
+same order of work). 120 requests per hour per account, and a daily budget of
+50,000 resolved uins. ⚠ The daily budget is charged in whole quanta of **64**,
+never in exact uins: the counter lives in Redis for 24 hours, and charging the
+exact count would write the caller's render-set SIZE into it on every
+refresh — a live sample of `|contacts(A)|`, from the one endpoint built to
+take the contact graph out of storage. Rounded up, the key holds a bucket
+count, and a list of 3 and a list of 60 cost the same
+(`LOOKUP_COST_QUANTUM`, `routers/users.py:684`).
+
 ## 5. Cryptographic Keys & Prekey Publishing
 
 The protocol carries two parallel key layers:
@@ -1416,6 +2003,27 @@ Response (`200`):
 `404` with body `"user has no signal bundle"` is returned when
 the target has not uploaded a libsignal bundle. The sender
 treats this as "fall back to v=1 envelope".
+
+⚠⚠ **On a closed island that same `404` means something else, and the two are
+deliberately indistinguishable.** This endpoint takes an OPTIONAL session
+(`current_uin_optional`), which makes it one of the three doors an outsider
+can reach at all, so it carries the closed-island gate of §5.7. A caller with
+no session and no guest card is refused with `404 "no such user"` — byte for
+byte what a number that does not exist answers, because a distinguishable
+refusal would turn a closed island into a directory for guessing which numbers
+exist, and short numbers are sold. The same `404` is already the multi-device
+"fall back to v=1" signal a few lines below (`routers/keys.py:478`), and it is
+also what a guest copy with no shared room gets (§2.15.5).
+
+**A client cannot tell those apart from the response and must not try.** It
+disambiguates from `capabilities.closed_island` (§2.13), which is published
+for exactly this reason: on an island that says `false`, a `404` here means
+"fall back to v=1"; on an island that says `true`, and for a caller with no
+account there, it may equally mean "you have no card for this person". Falling
+back is still the right move either way — the fallback asks
+`GET /federation/keys/{uin}`, which refuses the same caller the same way, so
+an outsider ends with no key rather than with a downgraded envelope — but only
+the capability lets the client say WHY to the person.
 
 `one_time_prekey` is null when the recipient's pool is
 exhausted. The sender may proceed without one (X3DH still works
@@ -1757,6 +2365,200 @@ device table, so it answers `404`; the primary refills through §5.2. The two
 pools are scoped apart on purpose (§5.6), and a client that confuses them
 drains one while believing it filled the other.
 
+### 5.7 The closed-island key door
+
+On an OPEN island anybody may be handed the key that seals an envelope to
+anybody, and that is not an oversight: it is what makes a number enough to
+reach a person. This section is about the other kind of island, the one whose
+operator has set `closed_island` and whose clients read
+`capabilities.closed_island: true` (§2.13).
+
+The rule is not a middle setting. It is a distinction between two SHAPES of
+request (`services/door.py`):
+
+| Shape | Example | On a closed island |
+|-------|---------|--------------------|
+| POINT | "give me the key for number N", one number, named by the caller | a RESIDENT may. This is messaging a colleague whose number is on their badge |
+| DISCOVERY | a search result, a lookup of arbitrary numbers, a directory page | nobody, ever. Bulk IS the attack. The rows keep their nicknames, badges and numbers and lose the three key fields (`strip_keys_from_discovery`, `services/door.py:86`) |
+
+⚠⚠ The line is NOT "point versus list". `GET /contacts` is a list and a group
+roster is a list, and both CARRY a relationship rather than search for one:
+your contacts are people you already added, a roster is a room you are already
+in. Strip those and every existing conversation stops sending at once, and
+group messaging does not degrade but stops dead, because `POST
+/messages/group-sealed` wants one ciphertext per member and a roster without
+keys cannot produce them. The line is between a list that ANSWERS a
+relationship and a list that SEARCHES for one.
+
+⚠ Stripping is not refusing. `/users/search` is the only way to add a
+same-island contact in the web client, and its rows render a nickname, a badge
+and a number and never touch the key. Refuse the rows and a closed island can
+never gain a contact; strip the keys and nobody notices.
+
+⚠⚠ **Exactly one endpoint strips today: `GET /users/search`**
+(`routers/users.py:639`, `with_keys=not closed`). `POST /users/lookup`
+(§4.10) — which the module docstring describes as discovery, "a lookup of
+arbitrary numbers" — runs no door of any kind and serves `identity_key`,
+`signing_key` and `signal_identity_key` for every row it resolves
+(`routers/users.py:930`). It applies the per-row VISIBILITY gates faithfully,
+and the key fields are not among them, so on a closed island a resident can
+read 256 keys per request from it and 50,000 a day. Stated here because this
+document records what the island does.
+
+⚠ **The key fields are not gated here, and `GET /users/search` gates the same
+three.** Search calls `door.strip_keys_from_discovery` and drops
+`identity_key`, `signing_key` and `signal_identity_key` on a closed island
+(`routers/users.py:639`); lookup never calls into `services/door.py` at all.
+The practical difference is smaller than it looks, because on a closed island
+those same three keys are what `GET /federation/keys/{uin}` hands an anonymous
+caller by design (§5.7): the seal-only card exists precisely so that an
+envelope can still be sealed to a resident. So this is an inconsistency between
+two surfaces rather than a way to learn something otherwise unreachable, and it
+is recorded here as one.
+
+**The header.** A stranger presents a guest card (§5.8) in
+
+```
+X-RCQ-Guest-Card: <the raw card, ~43 characters>
+```
+
+⚠ A header and never a query parameter, and that is not a style choice. A card
+is a live credential with no expiry: in a query string it lands in the
+island's access log, in the reverse proxy's, in any middlebox between them and
+in a `Referer`. That is exactly how session tokens leaked into journald until
+2026-08-22 — 816 distinct tokens over 449 accounts, 815 of them still valid.
+Anything longer than 128 characters is not a card and never becomes a database
+lookup (`card_from`, `services/door.py:63`). A card is looked up by HASH and
+scoped to the TARGET in the same query, so a leaked card costs its owner their
+quiet and costs nobody else anything.
+
+**The three modes.** `GET /federation/keys/{uin}` — the open public-key card,
+the door federation itself walks through, and the ONE door an outsider can
+reach with no session at all — answers with one of three values, not two
+(`open_card_mode`, `services/door.py:232`):
+
+| Mode | When | What goes out |
+|------|------|---------------|
+| `full` | an open island; or a valid guest card for this target | the whole card: `identity_key`, `signing_key`, `signal_identity_key`, `nickname`, and the optional profile fields the target's own visibility allows |
+| `seal` | a closed island, no card, `federation_refuse_strangers` NOT set | the three KEYS and nothing else. `nickname` is `null`, every profile field is `null`, `profile_openable` is `false` |
+| `refused` | a closed island with `federation_refuse_strangers` set | `403 "island_closed"` |
+
+★ Why `seal` exists at all, in one sentence: refusing this endpoint does not
+close an island, it unplugs it. It is the first step of every cross-island
+contact request, and ACCEPT breaks too, because the accepting client re-fetches
+the same card before it answers. The flagship ran refused-by-default for hours
+on 2026-09-09 and the only visible symptom was "cannot add people from other
+islands". So a stranger gets enough to seal one envelope to a number they
+already knew, and not a nickname, not a profile, not a hint that the number is
+worth anything — a nickname is how you check that the number you typed is the
+person you meant, and that confirmation is precisely what a closed island is
+refusing to give.
+
+⚠⚠ **The policy is decided BEFORE the number is looked up**
+(`routers/federation.py:398`). An island that refuses strangers answers every
+caller identically whether the number exists or not, so a refusal is a
+statement about the ISLAND and never an answer about a person. Reversing those
+two lines turns a closed island into a directory.
+
+**Which doors are gated.** The point-lookup rule (`may_fetch_key`,
+`services/door.py:262`) admits: the caller themselves, always, because a
+client re-reads its own card on every boot; any RESIDENT, where a resident is
+an account row on this island with `guest_status` NULL — a guest copy is
+explicitly NOT one, or a free token obtained by self-joining one open room
+would walk the numbers a request at a time; and a stranger holding the target's
+own card.
+
+| Door | Auth | Gated | Refusal |
+|------|------|-------|---------|
+| `GET /federation/keys/{uin}` | none | yes, three modes | `403 island_closed`, or a stripped card |
+| `GET /keys/{uin}/bundle` (§5.3) | optional | yes, for callers with no session | `404 "no such user"` |
+| `GET /keys/{uin}/devices/{id}/bundle` | optional | yes, same rule | `404 "no such user"` |
+| `GET /keys/{uin}/devices` (§5.6.2) | optional | yes, same rule | `404 "no such user"` |
+| `GET /users/{uin}/info` (§3.1) | required | yes, but see below | `404 "no such user"` |
+
+⚠ The gate on `/users/{uin}/info` can never refuse anybody, and this is
+recorded rather than hidden: that endpoint requires a session, so every caller
+that reaches it already holds an account here, `_is_resident` is therefore
+true, and the card branch is unreachable because a stranger cannot
+authenticate to present one. Found by an HTTP-level test on 2026-09-07 after
+the unit tests had passed for a day. It still refuses a GUEST copy that shares
+no room (§2.15.5), which is a different rule in the same handler.
+
+⚠ A closed island turns `capabilities.anon_keys` OFF only in combination with
+`federation_refuse_strangers` (§2.13). The trade behind that: a closed island
+has to tell a resident from an outsider at the key doors, and an anonymous
+fetch names nobody by design, so either the door lets every anonymous caller
+through, which is no door, or it refuses residents using the anonymous path.
+The cost is real — the island then learns which resident asked about whom,
+metadata it does not learn on an open island.
+
+⚠ `403` is not available as a refusal on the bundle doors, and this is why
+they answer `404`: all three first-party clients respond to a `403` from a key
+fetch by RETRYING THE SAME REQUEST WITH THE SESSION TOKEN. A closed island
+refusing an anonymous fetch would therefore get the request back
+authenticated, see a resident, and let it through — the gate removing itself,
+and dragging every bundle fetch back onto the authenticated path on the way,
+which re-links sender to recipient and undoes the point of anonymous key
+fetches (§2.13 `anon_keys`).
+
+### 5.8 Guest cards: `/guest-cards`
+
+A resident's own doorbell keys for a closed island (§5.7). Three endpoints,
+all acting on the caller's own cards.
+
+⚠⚠ **The island never sees a card.** The client generates 32 random bytes and
+sends only the **sha256** of them; the raw value goes to the person it is for,
+in the fragment of a shared link or inside a sealed envelope. That is why
+there is no "mint" endpoint here returning a card: a server-side mint would
+put the live credential in a response body, in an access log and in a
+database, which is three places it does not need to be, and a database read
+would then be enough to write to anybody — the exact failure `invites.code`
+had until 2026-08-22.
+
+⚠ The island also never learns who a card was FOR. A client may name a card
+for its owner's own eyes ("the QR from the meetup"); nothing here accepts,
+stores or returns anything about the recipient.
+
+```
+POST /guest-cards
+  { "card_hash": "<64 lowercase hex, sha256 of the 32 raw bytes>",
+    "label": "<string|null, max 64, the owner's own note>" }
+→ 201 { "card_hash": "<hex>", "label": "<string|null>",
+        "created_at": "<ISO>", "last_used_on": "<YYYY-MM-DD|null>",
+        "revoked": <bool> }
+
+GET /guest-cards
+→ 200 [ <the same row shape>, ... ]      newest first
+
+DELETE /guest-cards/{card_hash}
+→ 204
+```
+
+`card_hash` must match `^[0-9a-f]{64}$` or the island answers `400 "card_hash
+must be sha256-hex"`, loudly and on both the write and the delete
+(`routers/guest_cards.py:41`). ⚠ Loudly on purpose: a client that sends the
+RAW card here has just tried to hand the island the one thing this design
+keeps away from it, and storing it quietly would look like success for months.
+
+`POST` is idempotent for the owner — re-registering a hash you already own
+returns the existing row, which covers a retry after a dropped response — and
+a flat `409 "card already registered"` for anybody else, because
+re-registering somebody else's card under your own number would let you decide
+who may write to them. At most **200** live cards per resident (`409 "too many
+cards; revoke one first"`); the cap is not a licence limit, it bounds how
+large one account can make a table on somebody else's disk.
+
+`DELETE` is scoped to the caller inside the UPDATE itself rather than checked
+first and then written, because check-then-act lets somebody revoke a card
+that is not theirs by winning a race, and revoking a card is how you cut
+somebody off from the person they were talking to. It answers the same `404
+"no such card"` for "not yours" and "does not exist", so it is not a way to
+ask whether a card belongs to somebody else.
+
+`last_used_on` is a **DAY and not a timestamp**, and is written only when it
+changes (`services/door.py:145`). Enough for the owner to see that a card is
+still in use, not enough to be an activity feed about whoever holds it.
+
 ## 6. Messaging Protocol
 
 ### 6.1 Envelope formats
@@ -1798,7 +2600,7 @@ not enforce the list):
 | `secscreen`     | Secure-mode state for a thread                                  |
 | `skdm`          | Sender-key chain distribution (§6.5)                            |
 | `sknack`        | Sender-key recovery request (§6.5)                              |
-| `call`          | Cross-island call signalling (`federation-protocol.md` §5d), and the legacy way to ask for a ringing wake (§6.2.1.1) |
+| `call`          | Cross-island call signalling, and the legacy way to ask for a ringing wake (§6.2.1.1). ⚠ The cross-island half is not specified in any published document (§0) |
 | `gmsg`          | Sender-key group broadcast (§6.5)                               |
 | `carbon`        | Copy of your own send, to your other devices                    |
 | `homerec`       | Silent sync of a signed home-island record                      |
@@ -1931,8 +2733,8 @@ on that row: nothing names them, so they land there with every unknown kind.
 ⚠ **`carbon` and `homerec` land in content, and content pushes.** That is a
 behaviour change nothing in their own descriptions predicts: `homerec` is a
 silent record sync (§6.1) and a `carbon` is the echo of your own send to your
-own devices (§7.4.11), so a user now gets a banner for a note they just typed
-themselves on the other device. §7.4.11 tells a client to type notes to self
+own devices (§7.4.12), so a user now gets a banner for a note they just typed
+themselves on the other device. §7.4.12 tells a client to type notes to self
 `carbon` rather than `message` precisely to avoid that, and the reason it gives
 stopped holding when the pushable set widened. It is stated here rather than
 fixed here: this document records what the island does.
@@ -2918,6 +3720,146 @@ Acknowledgement model:
   implicit ACK; `ack=true` uses an explicit `POST /messages/queue/ack`
   (§6.3.1.1) so a lost response cannot drop messages. See §6.3.1.
 
+#### 6.3.3 `POST /messages/group-log/fetch`
+
+The ROOM receive path. Where §6.3.1 serves one queued copy per member per
+post, this serves **one log per room** and every member reads the same rows:
+the broadcasts everyone reads, plus the rows sealed to this member, in one
+sequence per room. Gated on `capabilities.group_log` (§2.13), which is a
+permanent capability of this codebase.
+
+Authenticated, and **per install**: the cursor is keyed by the token's install
+id (§2.9), not by the account and not by the libsignal `deviceId`. A client
+keeps draining `GET /messages/queue` at the same time for whatever legacy rows
+it still holds, de-duplicating by the inner-content UUID, until that queue runs
+dry.
+
+Request (`GroupLogFetchIn`, `routers/messages.py:1802`):
+
+```json
+{
+  "rooms": [ { "gid": <int>, "after": <int|null> }, ... ] | null,
+  "limit": <int, 1..2000, default 500>
+}
+```
+
+`rooms` omitted or `null` means every room the account is a member of.
+Batched on purpose: a client with thirty rooms makes one round trip, not
+thirty. A named room the caller is not a member of is skipped rather than
+refused, because membership can change between the client's view and the
+island's.
+
+`after` is the client's own idea of where it is:
+
+- **omitted** — read from the island's stored cursor for this device. A device
+  that has never read this room starts **at the room's head**, not at zero: a
+  fresh install owes nobody a replay of the backlog, the same rule as the 1:1
+  account watermark (§6.3.1.2). The seeding is one upsert, so two first reads
+  from the same device cannot collide.
+- **given** — read from there instead, which is what a client does to re-drain
+  after losing local state. ⚠ It never moves the stored cursor. Only an ack
+  does.
+
+Response (`GroupLogFetchOut`, `routers/messages.py:1818`):
+
+```json
+{
+  "rows": [
+    { "gid": <int>, "seq": <int>, "envelope_type": "<string>",
+      "cls": <int 0|1|2>, "payload": "<base64>", "received_at": "<ISO>" },
+    ...
+  ],
+  "heads":   { "<gid>": <int>, ... },
+  "cursors": { "<gid>": <int>, ... },
+  "more":    <bool>
+}
+```
+
+`heads` is each room's log head as of this fetch, so a client can tell
+"nothing new" from "this room has no log yet". `cursors` is where this
+device's cursor stands after the call — for a device that had none, the head
+it was just seeded at. `more` means ask again from the last `seq` you read.
+
+⚠⚠ **A page is bounded by BYTES as well as by `limit`, and the byte budget can
+cut a page the caller's `limit` would not.** The budget is
+`GROUP_LOG_PAGE_BYTES = 128 KiB` of payload, spent across every room in the
+one call — the body the client has to read is the whole answer, not one room's
+share of it (`routers/messages.py:1800`). A row is charged AFTER it is in, so
+a single row larger than the entire budget still goes out on its own; it could
+otherwise never be served and would pin its room for ever. No client needs to
+know this: `more` already means "ask again", every client already loops on it,
+and a page cut by bytes is indistinguishable from one cut by `limit`.
+
+★ Why the budget exists. 500 rows of one flagship room is 558 KB of JSON,
+about 335 KB gzipped, and clients were walking away from bodies that size
+mid-transfer on mobile links. A body that is never fully read is a page that is
+never acked; the island moves the cursor only on an ack, so the next fetch
+rebuilds the identical page from the identical cursor. That is a starvation
+loop, and it is worst for whoever has the most to catch up on — one account
+was measured 1491 rows and thirteen days behind its room while fetching every
+few hours.
+
+**The reader mark.** A fetch or an ack can mark THIS DEVICE as a log reader.
+Once every device of an account that still drains the legacy queue is a
+reader, the writers stop producing legacy per-member rows for that account
+(§6.3.3.1). The rule is:
+
+> ⚠⚠ **The mark is earned by an ACK, or by a fetch that had nothing to
+> return — never by asking.**
+
+`POST /messages/group-log/ack` always marks (`routers/messages.py:2052`). A fetch marks
+**only when it returns zero rows** (`routers/messages.py:1984`). ⚠ The
+handler's own docstring still says the fetch marks unconditionally; the code is
+what runs, and the code is this. A mark is the statement "this device is
+RECEIVING", and a fetch does not say that: the starving account above refreshed
+its mark on every single fetch, which made the starvation invisible to the
+stale-reader sweep and kept the legacy path shut for a device that was reading
+nothing. An EMPTY answer still marks, because a device level with every room
+has nothing to ack and would otherwise never qualify at all.
+
+Rate limit: 480/minute (§12.2). ⚠ It was 120, which is below what one honest
+catch-up costs: a client pages until the island runs dry, capped at forty pages
+per drain, and a drain fires on reconnect, on a push and on foreground. Forty
+pages plus a push ten seconds later is eighty in a minute from one phone doing
+exactly what it should. Over the ceiling the drain dies mid-backlog, the
+backlog never clears, and the next drain starts into the same wall.
+
+#### 6.3.3.1 `POST /messages/group-log/ack`
+
+Moves this device's cursor forward in each room.
+
+```json
+{ "rooms": [ { "gid": <int>, "upto": <int> }, ... ] }
+→ 200 { "deleted": <int> }     // how many rooms moved
+```
+
+**Forward only**, so a stale, repeated or out-of-order ack is harmless and
+writes nothing at all — no write, therefore no stamp either. An ack for a room
+this device never fetched SEEDS the cursor at `upto` rather than being dropped:
+a client that persisted the row off the live socket is telling the island where
+it is. Every write is a single upsert with the monotonic rule inside the
+statement, never read-then-INSERT: two acks from one device overlap whenever a
+client pages through a catch-up, and the loser's INSERT used to die on the
+primary key, roll back, and return `200` with the ack discarded while the
+island kept rebuilding the same page. Rooms are locked in `gid` order so two
+acks listing the same rooms differently cannot deadlock.
+
+`deleted` counts rooms whose cursor moved, and deletes nothing: a room log has
+ONE retention window for the whole room, not a per-member keep, which is the
+whole point of serving one log instead of N copies.
+
+Rate limit 480/minute, and it must stay at or above the fetch ceiling: this is
+one ack per fetched page, and an ack refused after its page was read leaves the
+cursor behind and the room re-delivers the same rows.
+
+**When the legacy rows stop.** An account needs no per-member legacy row once
+at least one of its devices has read the log AND none of its legacy-draining
+devices — the ones holding a `queue_cursors` row — is still without a reader
+mark (`log_readers`, `services/group_log.py:29`). So a phone that updated
+first keeps the whole account on the old path for its old desktop, until that
+desktop updates or its stale cursor is reaped. Rows already in the legacy
+queue stay there and are drained as before.
+
 ### 6.4 Group messaging
 
 #### 6.4.1 Per-recipient sealed-sender (current default)
@@ -3494,12 +4436,19 @@ cadence. The server responds with `{"type": "pong", "t": "<ISO>"}`
 and bumps `last_seen` for the UIN.
 
 Online presence is **derived** from `last_seen` freshness; a
-silent client whose `last_seen` ages past 60s reads as
-offline to watchers, even without an explicit disconnect.
+silent client whose `last_seen` ages past 90s reads as
+offline to watchers, even without an explicit disconnect (§3.3).
 
 When the WS drops (clean disconnect, network drop, force-quit),
-the server schedules a debounced offline broadcast with a 60s
-grace window (`_OFFLINE_DEBOUNCE_SECONDS`). If the client
+the server schedules a debounced offline broadcast with a grace
+window, and that window is **defined as equal to the freshness window of
+§3.3** rather than as a constant of its own:
+`_OFFLINE_DEBOUNCE_SECONDS = float(PRESENCE_FRESHNESS_SECONDS)`
+(`routers/ws.py:604`), so 90s today. ⚠ Derived and not copied: the debounce
+reasons out loud that it is "the same length as the freshness window", and
+while the two were separate numbers that sentence was one edit away from being
+false. A third implementation should derive it the same way rather than
+hard-coding either number. If the client
 reconnects within the window, the scheduled task is cancelled
 and no flicker is observed. After the window expires:
 
@@ -3575,11 +4524,47 @@ Recipient sees:
 #### 7.4.4 Contact events
 
 ```json
-{ "type": "contact_request",  "request_id": <int>, "from_uin": <int>, "from_nickname": "<string>" }
-{ "type": "contact_response", "request_id": <int>, "accepted": <bool>, "to_uin": <int> }
-{ "type": "contact_removed",  "peer_uin":   <int> }
-{ "type": "vault_changed",    "slot": "<32 hex>", "version": <int> }
+{ "type": "contact_request",            "request_id": <int>, "from_uin": <int>, "from_nickname": "<string>" }
+{ "type": "contact_response",           "request_id": <int>, "accepted": <bool>, "to_uin": <int> }
+{ "type": "contact_request_cancelled",  "request_id": <int>, "from_uin": <int> }
+{ "type": "contact_removed",            "peer_uin":   <int> }
+{ "type": "contact_renamed",            "uin": <int>, "nickname": "<string>", "badge": "<string|null>" }
+{ "type": "vault_changed",              "slot": "<32 hex>", "version": <int> }
+{ "type": "vault_reset",                "reason": "identity_reissued" }
 ```
+
+`contact_request_cancelled` goes to the ADDRESSEE when the requester deletes a
+still-pending request (`routers/contacts.py:504`). It is a nudge and not a
+guarantee: a recipient who is offline simply finds the row missing from their
+next `GET /contacts/pending`, and a stale accept or decline against the gone
+row answers `404` harmlessly.
+
+`contact_renamed` goes to everyone holding this account as an unblocked
+contact (`_announce_rename`, `routers/users.py:1025`). It is a separate frame
+rather than a field on `presence` because presence has a visibility rule
+behind it — an invisible user is broadcast as offline, and only to the
+presence watcher set — and a name has none: every contact already reads it off
+the roster. Keeping them apart means neither has to borrow the other's
+audience. ⚠ `badge` is ABSENT on a plain rename and present only when the mark
+itself changed, so a client keying on the field is not told "no badge" by
+every nickname change; `null` is a real value there and means the mark was
+taken away.
+
+`vault_reset` goes to the account's OTHER sessions when `POST /auth/reissue`
+(§2.10) rotates the identity keys, which empties every vault slot
+(`routers/auth.py:1643`). ⚠ It is NOT a `vault_changed`, and the difference
+matters: slot names are derived from `identity_priv` (§4.9), so after a
+rotation the slots are not at a new VERSION, they are at new NAMES, and a
+per-slot nudge would send a device off to re-read a name that will never exist
+again. It means "the island's copy is gone and your derivation is retired,
+re-derive and republish" and never "wipe what you have" — a client that reads
+it as a wipe loses the only remaining copy the moment it rotates from an
+unnamed install. The rotating install is skipped by name, so an install whose
+token carries no name is NOT skipped and hears its own reset. Until this
+existed the route emptied the vault and announced nothing at all: a second
+device saw a slot reading `404` at version 0, which is byte for byte what a
+slot nobody has ever written reads, concluded "fresh account, publish what I
+have", and the two devices silently un-published each other.
 
 `vault_changed` goes to the OTHER sessions of the account whose slot moved
 (the new version; on a delete, the tombstone's), never to anyone else. The
@@ -3633,11 +4618,27 @@ form above.
 
 ```json
 { "type": "account_burned" }
+{ "type": "account_moved", "uin": <int> }
 ```
 
-Sent by `DELETE /auth/account` and by `POST /account/migrate`
+`account_burned` is sent by `DELETE /auth/account` and by `POST
+/account/migrate`
 to every socket still open for the burned UIN. Clients are
 expected to wipe local keys and route to the onboarding flow.
+
+`account_moved` goes to the sockets still open for the OLD number after a
+migration (§10.1), and `uin` is the number the account answers as now
+(`routers/migrate.py:421`). ⚠ It exists because `account_burned` was the only
+thing those sockets heard, and they are the account's own other devices: a
+phone left in a drawer while its owner bought a shorter number on a laptop
+erased a live account on its next launch. A client that knows this frame
+re-runs the `/auth/refresh` it would have run at its next start and follows the
+account to its new number; the `uin` rides along so it can tell that answer
+apart from somebody else's. A client too old to know the word gets nothing
+here and recovers on its next start through `/auth/refresh` and `moved_from`
+(§2.14), which is still better than wiping. Best effort and deliberately
+swallowed on failure: the migration is already committed when it is sent, and
+a nudge that threw would hand the caller a `500` for work that succeeded.
 
 Key-slot events:
 
@@ -3753,6 +4754,32 @@ Android client can raise a full-screen incoming-call UI. A
 way with `"kind": "end"`, so an incoming-call UI raised by the
 offer push is dismissed rather than left ringing.
 
+**Two more server→client frames, and a client that does not know them rings
+into silence.** Both go to the CALLER only, both on `call_offer` when the
+callee has no live socket, and they are mutually exclusive:
+
+```json
+{ "type": "call_unreachable", "from_uin": <int>, "call_id": "<string>" }
+{ "type": "call_offline",     "from_uin": <int>, "call_id": "<string>" }
+```
+
+| Frame | Sent when | What it means to the caller |
+|-------|-----------|-----------------------------|
+| `call_unreachable` | the callee has NO wake channel at all — no row in `device_tokens`, so no `ios`, no `ios-voip`, no `android-up` | nothing is going to ring on the other side, at all, ever. Stop the ringback now |
+| `call_offline` | the callee CAN be woken and is not there right now: the offer left as a push | nothing is ringing yet and may not for a while. Stop pretending with a ringback; say they are offline |
+
+⚠ `from_uin` here is the CALLEE — the number the caller dialled — because the
+whole call vocabulary relays with `from_uin` set instead of `to_uin`, and
+these two ride that convention rather than inventing a second one
+(`routers/ws.py:1093`, `:1110`).
+
+★ Why they exist. Without them the caller hears a ringback that the island has
+no basis for: a phone that is simply asleep, and a number that can never be
+woken, both sound exactly like being ignored until the call times out. Both
+frames are ADDITIVE — a client that does not know the type ignores it and
+behaves as it did before — which is also why a spec-built client that never
+learns them is not broken, only mute in the one case where it should speak.
+
 #### 7.4.8 Audio room events
 
 (Audio rooms are a business feature; the WS events are listed
@@ -3819,7 +4846,24 @@ wire addition into a landmine whose blast radius depends on
 which caller happens to hold the row — one message, or a
 whole queue drain.
 
-#### 7.4.11 Notes to self are carbons
+#### 7.4.11 Island broadcast: `news_posted`
+
+```json
+{ "type": "news_posted", "id": <int> }
+```
+
+The one frame sent to EVERY connected socket on the island rather than to an
+account or a room (`manager.broadcast_all`, `routers/news.py:254`). It carries
+the post id and nothing else: a client that knows it refetches `/news`, and
+the id doubles as the unread-dot driver so a badge can be bumped without the
+refetch. Shipped builds that do not know the frame ignore it and keep polling,
+which is the intended degradation.
+
+⚠ `/news` itself is out of scope (§14) — an operator-posted feed, not part of
+the messaging protocol. The frame is listed here because it rides this channel
+and a third implementation reading the socket will meet it.
+
+#### 7.4.12 Notes to self are carbons
 
 A note written in Saved Messages is addressed to the
 author's own uin, which is what puts it on their other
@@ -4170,10 +5214,11 @@ For each piece of media:
 3. Sender uploads the blob and receives a `media_id` (§9.2), or
    chooses the `media_id` itself, a uuid4 hex, and deposits the
    blob under it with `PUT /media/{media_id}` when the recipient
-   is on another island. That path is first-write-wins and is
-   specified with the rest of federation in
-   `docs/federation-protocol.md`; it takes the same opaque bytes
-   and the same cap as `POST /media/upload`.
+   is on another island. That path is first-write-wins: re-depositing
+   an existing id is an idempotent success and never an overwrite
+   (`routers/media.py:86`), and it takes the same opaque bytes and the
+   same cap as `POST /media/upload`. ⚠ The rest of federation is not
+   specified in any published document (§0).
 4. Sender constructs the message envelope normally
    (Section 6.1). The inner plaintext includes:
    - `media_id`
@@ -4522,18 +5567,23 @@ either. Android says so in the person's own words
 and is too big to open here (%1$d MB). Ask the sender to send it
 again from a newer version."
 
-### 9.5 `GET /media/usage`
+### 9.5 `GET /media/usage` (removed)
 
-Returns the caller's current-month traffic counter for the
-Settings readout:
+**This endpoint does not exist.** The `/media` router has exactly three routes
+— `POST /media/upload`, `PUT /media/{media_id}` and `GET /media/{media_id}`
+(`routers/media.py:70`, `:86`, `:114`) — and there is no traffic counter
+behind any of them. It went with the economy layer the 2026-05-27 pivot cut
+(§14.1); the `bytes_used` half of the old body was a jeton price meter.
 
-```json
-{
-  "year_month":     "YYYY-MM",
-  "bytes_used":     <int>,
-  "max_blob_bytes": <int>
-}
-```
+⚠ **It does not answer `404 Not Found` as a missing path, it is SWALLOWED by
+the blob route.** `GET /media/usage` matches `GET /media/{media_id}`, which
+tries to parse `usage` as a uuid4 hex, fails, and answers `404 "bad media
+id"` — a well-formed answer from a real handler. A client written to the old
+text cannot tell that from a media id that has expired, and neither can a
+third implementation reading a live island's behaviour. There is nothing to
+poll and nothing to fall back to: the only size number an island publishes is
+`capabilities.media_max_blob_bytes` (§2.13), which is a per-blob ceiling and
+not a quota.
 
 ### 9.6 Group avatars
 
@@ -5172,12 +6222,114 @@ Some endpoints return structured error bodies for client UI:
 - the vault (§4.9): `409 {"code": "stale", "version": <int>}` on a write or
   delete that names a version it was not based on, `404 {"code": "no_slot",
   "version": <int>}` on a slot that is absent or a tombstone
+- **the door** (§2.2, §2.15.3, §2.16), all from `invite`/`code`, the one field
+  that carries both an invite and an entry voucher:
+  `403 {"code": "invite_required"}` (policy `invite`, nothing presented),
+  `403 {"code": "entry_required"}` (policy `paid`, nothing presented),
+  `403 {"code": "invite_invalid"}` (no live, unexpired, unexhausted invite
+  matches), `403 {"code": "voucher_other_island"}` (signed for somebody else's
+  host), `403 {"code": "voucher_expired"}`,
+  `409 {"code": "voucher_spent"}` (the nonce is already in `spent_vouchers`),
+  `409 {"code": "invite_has_number"}` (an invite reserving a UIN applied to a
+  row that already has one), `409 {"code": "already_resident"}` and
+  `404 {"code": "sales_disabled"}` (§2.16).
+  ⚠ A string that is not a voucher at all — `bad_voucher` from the verifier —
+  is NOT refused: it may still be an invite, so it falls through to the invite
+  gate and is answered there (`routers/auth.py:449`, and the two that are not
+at `:455`). Only a voucher naming
+  another island or an expired one is refused outright, because neither can
+  ever be an invite.
+- the registration proof (§2.2, §2.8): `400 {"code": "invalid_challenge"}`,
+  `401 {"code": "bad_signature"}`, `403 {"code": "key_proof_required"}` (the
+  `signing_key` is already claimed by an account here and no proof was sent)
+- the island's own minting ceiling (§12.2):
+  `503 {"code": "island_busy", "retry_after": <int>}` with a `Retry-After`
+  header. ⚠ `503` and not `429`, and the difference is the client's: nothing
+  is wrong with THIS caller, the island is simply not minting right now, so
+  the right response is to retry rather than to tell the person they did
+  something too often.
 
 ### 12.2 Rate limits (messaging-layer endpoints)
 
 All limits are per-identity (UIN for authenticated requests,
 client IP for anonymous), sliding window, backed by Redis.
-Limits fail-soft: a Redis outage allows the request through.
+Most limits fail-soft: a Redis outage allows the request through, because a
+brief outage should not surface as `429` for legitimate users and a spammer
+would not notice the gap anyway.
+
+⚠⚠ **Sixteen rules now fail CLOSED, and that is a correction rather than a
+refinement.** On 2026-09-01, 552 accounts were registered in three minutes —
+211 in one of them — through a route carrying
+`rate_limit("auth_register", 20, 3600)`. The limiter did exactly what it was
+told: every Redis error was fail-soft, so an outage, or anything that made the
+eval throw, turned the cap off entirely. A messenger that mints identities
+cannot have its only cap living in another process.
+
+"Closed" does not mean "refuse everyone". It means falling back to a sliding
+window **inside the worker**, which needs nothing outside it
+(`_local_allow`, `core/rate_limit.py:330`). That fallback is deliberately
+coarse: with N uvicorn workers the effective cap is N times the number. The
+point is to turn an unbounded flood into a bounded trickle, not to be exact.
+
+The whole registration path fails closed, and so does every path that mints an
+identity, a seat, or an entitlement:
+
+| Rule | Limit | Window | Endpoint |
+|------|-------|--------|----------|
+| `auth_register_challenge` | 60 | 3600s | `POST /auth/register/challenge` |
+| `auth_register_challenge_net` | 240 | 3600s | the same, per /24 or /64 |
+| `auth_register` | 20 | 3600s | `POST /auth/register` |
+| `auth_register_net` | 60 | 3600s | the same, per /24 or /64 |
+| `auth_guest_challenge` | 60 | 3600s | `POST /auth/guest/challenge` |
+| `auth_guest_challenge_net` | 240 | 3600s | the same, per /24 or /64 |
+| `auth_guest` | 10 | 3600s | `POST /auth/guest` |
+| `auth_guest_day` | 30 | 86400s | the same |
+| `auth_guest_net` | 30 | 3600s | the same, per /24 or /64 |
+| `guest_settle` | 10 | 3600s | `POST /auth/guest/settle` |
+| `residency_redeem` | 10 | 3600s | `POST /residency/redeem` (§2.16) |
+| `groups_guest_add` | 20 | 86400s | `POST /groups/{id}/guests` |
+| `groups_guest_add_burst` | 10 | 3600s | the same |
+| `guest_add_group` | 100 | 86400s | the same, per ROOM |
+| `guest_room_join` | operator setting `guest_room_joins_per_day` (200) | 86400s | per ROOM, on every path that puts a guest in one: `POST /auth/guest`, `POST /groups/{id}/join`, `POST /groups/{id}/members` and `POST /groups/{id}/guests` |
+| `guest_report` | 5 | 86400s | `/reports`, for a guest caller only |
+
+**Per-subnet buckets.** Four of those are keyed by the caller's /24 (IPv4) or
+/64 (IPv6) instead of the single address (`by_subnet=True`, `_subnet_of`,
+`core/rate_limit.py:349`). One address is the wrong unit to price a flood in:
+552 registrations at 20 per address per hour is 28 addresses, which is a
+morning's work with any proxy pool, while 28 addresses inside one /24 is one
+rented machine. Keyed per subnet the same flood needs 28 genuinely different
+networks.
+
+**The island-wide ceiling.** Per-identity limits price abuse for ONE actor and
+say nothing about how many identities may be minted in total, which is the
+number that was missing in September. Three routes carry a ceiling on the
+whole island, fail-closed, over which they answer
+`503 {"code": "island_busy", "retry_after": <int>}` (§12.1):
+
+| Rule | Per minute | Per hour | Route |
+|------|------------|----------|-------|
+| `auth_register` | 40 | 400 | `POST /auth/register` |
+| `guest_mint` | 30 | 600 | `POST /auth/guest` |
+| `guest_add` | 30 | 600 | `POST /groups/{id}/guests` |
+
+Each is a separate bucket, so owner-adds cannot starve self-joins or
+registrations. The numbers are deliberately far above real life: the busiest
+minute in the flagship's history outside that flood was 12 registrations.
+Defaults are in `core/config.py:60`; an operator may raise them, and the
+dependency reads the value on each request rather than at import, so a change
+takes effect without a restart.
+
+⚠ The identity written into a bucket key is HMAC'd before it reaches Redis
+(`bucket_name`, `core/rate_limit.py:77`). `POST /messages/sealed` takes no
+auth precisely so the island does not learn who sent an envelope, and the
+limiter used to write `rl:messages_send:uin:<sender>` with a timestamp on
+every send — the sender identity the island refuses to keep in Postgres,
+written to Redis on every single send. The HMAC stops a Redis dump reading as
+a plaintext who-talked-when list. It is NOT protection against seizure of the
+host, where the secret lives on the same disk, and it is a stable pseudonym
+rather than an anonymiser: a dump still supports counting and correlation, it
+just cannot name anyone without the secret.
 
 | Rule                  | Limit       | Window   | Endpoint                              |
 |-----------------------|-------------|----------|---------------------------------------|
@@ -5420,7 +6572,24 @@ protocol:
   capability this protocol promises the operator does not
   have. The push that announces an answer carries no part of
   its text
-- `/news`: admin-posted feed
+- `/news`: admin-posted feed. It does reach this channel once, as the
+  `news_posted` broadcast of §7.4.11
+- `/entry/payout-target` — the island's half of selling ENTRY (§2.2, §2.16).
+  `POST` only, and no client ever calls it: the caller is the operator's TILL,
+  asking what this island charges and where its operator is paid, per invoice,
+  so that a till carrying its own copy of the price or the wallet cannot drift
+  from the console with nobody watching. The island itself never touches money.
+  Authenticated by a SIGNED request document rather than a session
+  (`routers/entry.py:57`), and the signature is not about secrecy — a price is
+  public — it is about WHICH till this island answers to: the one whose public
+  key is in `uin_voucher_pubkey`, because that is the only till whose vouchers
+  it will redeem. A stray copy of the worker deployed against the wrong island
+  would otherwise be told these wallets, write invoices in this island's name,
+  and sell entry codes the island then refuses, with no refund path. Refusals,
+  in order: `403 {"code": ...}` when the request is not from the trusted till,
+  is stale, or names another island; `409 {"code": "not_for_sale"}` when the
+  price is zero; `409 {"code": "no_payout"}` when the operator has named no
+  wallet, because a price nobody can be paid at is not a sale
 - `/admin` — admin panel (HTTP Basic, separate auth from the
   user JWT)
 
@@ -5569,7 +6738,7 @@ implementation already does) may go straight to PR.
 
 ### 15.2 Versioning
 
-This document is **v1.17**. The protocol wire major is still v1;
+This document is **v1.18**. The protocol wire major is still v1;
 the `.x` suffix tracks doc revisions. Wire-breaking changes would
 bump the major. Additive endpoints, new optional fields, and new
 envelope types do not require a major bump; they are recorded in
@@ -5595,7 +6764,7 @@ rather than a field (§9.4.7), and a spec version cannot enforce that. Read
 | v1      | 2026-05-26 | Initial public spec, covering the messaging core as deployed in TestFlight build 54. |
 | v1.1    | 2026-05-27 | Pivot pass. Section 14 trimmed: cut routers documented as removed; UIN shop + IAP-priced hood banners documented as the only paid surfaces (mock receipt). No wire-breaking changes to the messaging core. |
 | v1.2    | 2026-06-04 | Documented two shipped additive features. New §2.7 Account recovery (opt-in BIP39 seed phrase, `POST /auth/recover/challenge` + `POST /auth/recover` Ed25519 challenge/response; 48-word legacy raw-key export) — corrects the earlier "recovery is not possible" framing. New §5.6 Multi-device (secondary devices: `POST /keys/devices`, `GET /keys/{uin}/devices`, `GET /keys/{uin}/devices/{device_id}/bundle`, per-device OPK pools, `device_id` + `sealed_sender_pub` bundle fields, sender fan-out). No wire-breaking changes. |
-| v1.3    | 2026-06-11 | Economy scrub: removed all remaining inline references to the gamification/economy layer that the 2026-05-27 pivot cut but earlier passes had left dangling in the live sections — jeton media pricing (uploads are now flat-free to the 2 GB safety cap, §9.1/§9.2/§9.5), premium media unlock (§9.7 deleted), paid groups (§6.4 join/invite + the related 402/`paid_group_*` error codes), the `equipped_pet`/`trade_policy`/`reputation`/`reputation_visibility` profile fields + `trades_from_*` push prefs (§3), the jeton-reaction note (§7.4), `trade_received` push gating (§8.4), and the wallet/inventory/trades/marketplace/pets/reputation rows in the migration carryover table (§10.1). Migration is now free. §14.1 already documented the pivot; this aligns the rest of the spec with it. No wire-breaking changes. (Cross-island federation — home-island records, `uin@host`, room-host groups, multihoming — is specified separately in `docs/federation-protocol.md` and is not yet folded into this document.) |
+| v1.3    | 2026-06-11 | Economy scrub: removed all remaining inline references to the gamification/economy layer that the 2026-05-27 pivot cut but earlier passes had left dangling in the live sections — jeton media pricing (uploads are now flat-free to the 2 GB safety cap, §9.1/§9.2/§9.5), premium media unlock (§9.7 deleted), paid groups (§6.4 join/invite + the related 402/`paid_group_*` error codes), the `equipped_pet`/`trade_policy`/`reputation`/`reputation_visibility` profile fields + `trades_from_*` push prefs (§3), the jeton-reaction note (§7.4), `trade_received` push gating (§8.4), and the wallet/inventory/trades/marketplace/pets/reputation rows in the migration carryover table (§10.1). Migration is now free. §14.1 already documented the pivot; this aligns the rest of the spec with it. No wire-breaking changes. (Cross-island federation — home-island records, `uin@host`, room-host groups, multihoming — was not folded into this document. It was recorded here as living in a separate `docs/federation-protocol.md`; that document is not published, see §0.) |
 | v1.4    | 2026-07-31 | Android push documented at last: new §8.7 UnifiedPush (endpoint registration with `platform: "android-up"`, wake payload, mandatory RFC 8030 `TTL`, the retry/prune table and why `507`/`429` from a public ntfy are retryable rather than fatal), `GET /users/me/push-health` and the widened `POST /users/me/push-token` in §3.5, and the offline-queue retention rules in §6.3.1 (30-day TTL plus the 14-day dormant-recipient rule that group rows are subject to and 1:1 rows are not). Documents shipped behaviour; no wire-breaking changes. |
 | v1.5    | 2026-07-31 | §8.7 gains the embedded distributor the Android client ships since v0.74 (own topic, own push server, resume-from-id on reconnect) and the operator guidance that goes with running one. No wire change: an embedded distributor is indistinguishable from ntfy on the wire. |
 | v1.6    | 2026-08-04 | Call signalling brought up to what the clients actually send (§7.4.7): the `call_ice_restart` / `call_ice_restart_answer` pair, the encoding of `sdp` (raw text) and of `candidate` (a JSON string whose candidate line is under the key `sdp`) — the two details a third implementation cannot guess and whose absence yields a silent call — multi-device ringing and the `answered_elsewhere` end reason, the enumerated end reasons, and the UnifiedPush call wake alongside the iOS VoIP push. Also corrects §0 and §15.2, which still stamped the document v1.3 (2026-06-11) after the v1.4 and v1.5 revisions. No wire change: all of it documents shipped behaviour. |
@@ -5611,3 +6780,4 @@ rather than a field (§9.4.7), and a spec version cannot enforce that. Read
 | (none)  | 2026-09-01 | **Reserved numbers leave the allocator** (§2.1, §14). Went out unstamped in `9c0eb44` and is backfilled here because it changes what three paths answer. A number is reserved when it is short (six digits or fewer) or patterned (all one digit, a repeating pair or triple, the full ladder either way, four or more trailing zeros); the random allocator never returns one, `desired_uin` at registration refuses one unless the caller proves prior tenure with a signed home-island record naming it, and the free claim of §14 refuses one outright. **Collections are closed**: `/uin/quote` answers `available: false, reason: "reserved"` and `/uin/purchase` answers `403 {"code": "reserved"}` for such a number, `max_owned` is pinned to 0, and an identity holds exactly the number it answers as; `owned_uins` stays in the schema for rows from before. An operator can still grant one (`POST /admin/uin/grant`, or an invite carrying the number). Why: there are 999 three-digit numbers in existence and there will never be more. |
 | v1.16   | 2026-09-02 | **Island trust without a certificate authority** (new §11.6). A client trusts an island one of two ways: through the platform trust store as before, or, when the platform refuses the chain, by the SHA-256 of the DER leaf, pinned on the device the way an SSH host key is. The rule in full (§11.6.1): a CA-valid chain is accepted and writes a `ca` record even over a pin, so a Let's Encrypt renewal never warns and an island that moves to a CA needs nothing from its users; an unknown host with a private certificate is accepted on first use and said out loud once; a pinned host whose leaf changed, or a CA host now showing a private certificate, is NOT connected to at all until a person accepts the new fingerprint from a banner. The CA-only list, `api.rcq.app`, the front and everything under `rcq.app`, is never trusted on first use (§11.6.2). The canonical, accepted and display forms of the fingerprint, and why it is the leaf and not the SPKI (§11.6.3); the `host[:port]#fp` fragment every address form takes, which pins BEFORE the first connection and turns a mismatch into a refusal, and the device-scoped `host:port` store (§11.6.4); the four outcomes and what each one shows, and why a browser is left out (§11.6.5); what an island must do, a long-lived leaf with the address in the SAN, and why the CLI alone needs the SAN (§11.6.6); and the residual risk written down rather than claimed away: a first contact on a hostile network pins the attacker, and an impostor island is a hostile island with a hostile island's powers and no more (§11.6.7). No byte on the wire changes and `/server/info` deliberately does not carry the fingerprint. **`links_allowed` and `files_allowed` documented** (§6.4.3, §6.4.2, new §6.4.9): two owner-only booleans have lived on the island since 2026-08-21 and this document had no words for them. They are the first group rules the island CANNOT enforce, since it cannot see inside a sealed envelope, so they are house rules the clients keep on the owner's behalf and never a security boundary. `files_allowed = false` blocks documents, photos and videos and not voice notes, the rule decided 2026-09-02; ⚠ the clients shipped on that date still gate the microphone (Android 0.160, the web) or only the document chip (iOS). Exemption is the owner, admins and any granted cap, both ways. **Corrections.** §15.2 still stamped the document v1.12, and this history stopped there while the title had been stamped v1.13, v1.14 and v1.15 on 2026-08-30 without a row each; the three rows above are backfilled from the diffs, and so is the unstamped 2026-09-01 row. |
 | v1.17   | 2026-09-02 | **§11.6 tightened after review, the same evening.** Five changes to the rule of §11.6.1 and its surroundings, none of them on the wire. (1) A TYPED fingerprint wins over an authority: a chain that does not hash to the value the person entered is `REFUSE(changed)` even when the platform trusts it, where v1.16 let any CA-valid chain overwrite the typed pin silently, so the "careful path" of §11.6.4 promised what the rule did not give; accepting that banner records `ca` (§11.6.5), and §11.6.6 now says a move to a CA is silent for first-use and accepted pins and one banner for typed ones. (2) `caValid` is defined as chain AND name for the dialled host, since a chain validator that ignores the name (Android's) would have let a captive portal's certificate write `ca` over a pin. (3) The rule runs on BOTH outcomes of platform validation on every client, and the text says why: without the `ca` write on success there is no `ca` record, and a known CA island is an unknown island to an attacker's self-signed certificate. (4) A fragment against a record that disagrees is `REFUSE(changed)` with a banner, never a silent write, and a fragment that is not 64 hex is an address error with no connection (§11.6.4). (5) A refusal is not a blocked route: the client does not engage relays or a front, retry, or report censorship on it, and a probe answers reachable / refused / unreachable (§11.6.1, §11.6.5). §11.6.7 corrects an overclaim: an impostor island reads no body of an EXISTING session, but a first contact or a registration made through it rests on safety numbers, as against a compromised backend. **§6.4.9**: a `.rcq` site address joins the set `links_allowed = false` blocks, which the renderers already honoured while the send gates did not. **§15.3**: the 2026-09-01 reserved-number change gets its own row. |
+| v1.18   | 2026-09-19 | **The document caught up with the server, against `rcq-server-ref`.** Nothing here changes the wire; all of it changes what this document says the wire is, and four of the items below would have produced a working-looking client that fails in the field. **`GET /server/info` was missing fourteen things** (§2.13): `closed_island`, `cross_island`, `entry_price_cents`, `entry_url`, `till_url`, `terms_url`, `user_count`, `max_accounts_per_device`, `users_lookup`, `contacts_readonly`, `contact_pending_withdraw`, `guest_accounts_v1`, `reissue_proof_v1`, and `badges`, which is a TOP-LEVEL sibling of `name` and `logo_version` and not a capability at all. Each is documented with its absent-reads-as default, and ⚠ `contact_pending_withdraw` is the one key whose permissive reading is wrong: absent means NO withdraw, and a client that declines instead leaves the requester an answer they keep for 180 days. **`POST /auth/register` was documented as it stood in v1** (§2.2): the request gains `invite`, `desired_uin`, `home_record`, `device_id`, `challenge` and `signature`, the response gains `guest`, and the `invite` field is one box carrying either a server-join invite or a paid ENTRY VOUCHER, with the voucher redeemed whenever it verifies even on an open island. `registration_policy` has a third value, `paid`. The side-effects list promised a starter pack of currency and three random items and a referral row; both were deleted, and what actually happens is two mutual contact edges and nothing recorded. The door refusal codes are now in §12.1. **Guest copies** (new §2.15): `POST /auth/guest/challenge`, `POST /auth/guest`, `POST /auth/guest/settle`, `POST /groups/{id}/guests`, the `rcq-guest-v1` proof bytes, the `guest` flag on the register/refresh/recover replies, and the RESTRICTION SET a guest lives under — written out in full because a client that does not know it draws buttons that always fail, and because two of those restrictions answer an empty list rather than a 403 on purpose. **Guest cards** (new §5.8) are a separate, earlier feature and share only the word: three endpoints, and the island never sees a card, only the sha256 of 32 bytes the client generated. **The closed-island key door** (new §5.7, and a warning added to §5.3): the three card modes `full` / `seal` / `refused`, the `X-RCQ-Guest-Card` header and why it is a header, the `403 island_closed` that happens only under the optional `federation_refuse_strangers`, and — the reason this is not editorial — the `404` that §5.3 told a client to read as "fall back to v=1" means "you have no card for this person" on a closed island, byte for byte identical on purpose so that a refusal is not a directory lookup. It is disambiguated by `capabilities.closed_island` and by nothing else. **The room receive path** (new §6.3.3, §6.3.3.1), which the spec named once as the `group_log` capability and never specified: both schemas, `after`, the per-device cursor that starts at the room's HEAD, the 128 KiB page budget that truncates a page regardless of `limit`, and the reader-mark rule — the mark is earned by an ACK or by a fetch that had nothing to return, never by asking, which the handler's own docstring still gets wrong — plus the rule that legacy per-member rows stop only once EVERY legacy-draining device of an account is a reader. **Corrections.** Presence freshness is 90 s and not 60 (§3.3, §7.3), and the offline debounce is defined as equal to the freshness window rather than as its own constant. §9.5 documented `GET /media/usage`, which does not exist and is swallowed by `GET /media/{media_id}`, so it answers a well-formed `404 "bad media id"` from a real handler rather than a missing-path 404. §3.1 was titled for `GET /users/me/info`, which returns `422` because the path parameter is an integer; the owner path is `GET /users/{own uin}/info`, and `badge` joins the always-present table. §12.2 said rate limits fail soft; sixteen rules now fail CLOSED, including the whole registration path, with per-/24 and per-/64 subnet buckets and an island-wide minting ceiling answering `503 island_busy`. §7.4.7 omitted `call_unreachable` and `call_offline`, so a spec-built client rings into silence; five more server-to-client frames are added (`contact_request_cancelled`, `contact_renamed`, `vault_reset`, `account_moved`, `news_posted` in new §7.4.11). **Four endpoints** shipped undocumented: `POST /residency/redeem` and `DELETE /invites/{invite_id}` (§2.16), `POST /users/lookup` (§4.10), and `/entry/payout-target` in the §14 index. **And the spec pointed four times at `federation-protocol.md`, which exists only in a private repository**; every pointer now says so instead (§0). |
