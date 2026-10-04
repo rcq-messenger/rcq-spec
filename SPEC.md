@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.18)
+# RCQ Protocol Specification (v1.19)
 
 ## 0. Status & Scope
 
@@ -47,7 +47,7 @@ Out of scope:
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1.18**. Last updated: **2026-09-19**. Spec maintainer:
+Version: **v1.19**. Last updated: **2026-10-05**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 
 ⚠ **Known gaps.** The endpoint census below was taken on 2026-08-16 against
@@ -173,12 +173,11 @@ in either direction (`123456789`, `987654321`), or four or more trailing
 zeros. Reserved numbers are finite stock: there are 999 three-digit numbers in
 existence and there will never be more. They are excluded from
   * the random allocator,
-  * `desired_uin` at registration (§2.2) UNLESS the caller proves prior
-    tenure — a signed home-island record (§3.2) naming that UIN under the
-    caller's own signing key, offered in the request or already mirrored on
-    this island. This is what keeps §5a multihoming working for someone whose
-    number happens to be short, while a squatter, who cannot sign for the key,
-    cannot ask for one at all,
+  * `desired_uin` at registration (§2.2) UNLESS an island the operator
+    trusts confirms that the caller already holds that number there (prior
+    tenure; the rule is in §2.2, and a self-signed record is NOT proof of
+    it). This is what keeps §5a multihoming working for someone whose number
+    happens to be short; anybody else who asks for one gets a fresh number,
   * and the free claim of §14.
 
 They are still assignable by an operator: `POST /admin/uin/grant`, or an
@@ -235,7 +234,7 @@ Request (`RegisterIn`, `routers/auth.py:156`):
   "inviter_uin":  <int|null>,     // whose link brought this install here
   "invite":       "<string|null>", // invite token OR entry voucher, one box
   "desired_uin":  <int|null>,     // best-effort, multihoming (§5a)
-  "home_record":  <object|null>,  // signed home-island record proving tenure
+  "home_record":  <object|null>,  // signed home-island record: a POINTER to where tenure is confirmed
   "device_id":    "<string|null>", // stable per-INSTALL id, max 64 chars
   "challenge":    "<string|null>", // from POST /auth/register/challenge (§2.8)
   "signature":    "<base64|null>"  // Ed25519 over `challenge`, by `signing_key`
@@ -263,14 +262,58 @@ a credential is REQUIRED (`routers/auth.py:472`).
 `signing_key` (§2.8). Optional on the wire, because clients that predate the
 proof are in people's hands, and REQUIRED for the two cases where its absence
 is what an attack needs: a `signing_key` already claimed by an existing
-account (`403 {"code": "key_proof_required"}`, `routers/auth.py:392`), and
-`desired_uin` — which is honoured only under a proof (`routers/auth.py:610`).
+account (`403 {"code": "key_proof_required"}`, `routers/auth.py:389`), and
+`desired_uin`, which is honoured only under a proof (`routers/auth.py:614`).
 
 `desired_uin` is best-effort and never an error: granted only when the number
 is free in all three tables (§2.1) and, if it is a RESERVED number, only when
-`home_record` or a record this island already mirrors proves the caller
-already answers to it elsewhere (`_owns_uin_elsewhere`, `routers/auth.py:213`).
-Otherwise a fresh number is minted and nothing says so.
+an island on the operator's list confirms that the caller already holds it
+there (`holds_elsewhere` in `services/reserved_tenure.py`, called at
+`routers/auth.py:379`). Otherwise a fresh number is minted and nothing says
+so.
+
+⚠⚠ **Prior tenure is confirmed by an island the operator trusts, never by a
+record (since island 2026.10.01.01).** Until then a reserved number was granted
+on a home-island record naming it under the caller's own signing key, offered
+as `home_record` or found in this island's gossip mirror. A record is signed by
+its OWN `sk`: it proves who wrote it and nothing about what it says, so anybody
+who signed `{homes: [{host: "anywhere", uin: 777}]}` with a key of their own
+left with number 777. An island built to the older text of this section hands its
+short numbers to whoever asks. The rule now:
+
+- The offered `home_record`, or the record this island mirrors for the
+  caller's `signing_key`, is only a POINTER. It must verify under the caller's
+  `signing_key` and name the number on a host in the operator setting
+  `TENURE_TRUSTED_ISLANDS` (default `api.rcq.app,is2.rcq.app`). The island's
+  own names are dropped from that list, so an island never trusts itself: a
+  free number that a record claims is held HERE is a stale or false record.
+  At most three hosts are asked.
+- That host is asked over HTTPS, with redirects not followed and a 4 s budget
+  per host for both reads, for two things.
+  `GET /federation/island-record/{uin}` must return a record that verifies,
+  carries the same `sk` and names the number on THAT host.
+  `GET /federation/keys/{uin}` must return the same `uin` and the same
+  `signing_key`. The key card is the trusted island's own answer from its
+  account row. The record alone is not enough, because the holder of the
+  number there can publish somebody else's signed record and hand them the
+  number here.
+- Any failure (no pointer, a host not on the list, a timeout, a redirect, a
+  refusal, a mismatch) is "no", and the registration carries on with a fresh
+  number. Never an error: the person still gets their backup account.
+- The lookup happens only under a key proof (`challenge` + `signature`), and
+  not at all when the door is going to refuse the request anyway: an `invite`
+  or `paid` island with an empty `invite` field.
+- ⚠ The lookup MUST NOT be skipped because the number is already taken on
+  this island. It runs before the door answers, for anybody who signed a free
+  challenge, and a shortcut for a taken number makes the response time say
+  whether a short number is held, collected or promised by an invite here,
+  even on an invite-only or paid island. Whether the number is free is decided
+  afterwards, at the grant.
+
+Why a list an operator writes rather than "the island the record names":
+self-hosting is supported, so an island the caller names may be an island the
+caller runs, and it will say whatever they like. The two islands of the
+default list apply this same rule.
 
 Response (`201 Created`, `RegisterOut`, `routers/auth.py:196`):
 
@@ -612,9 +655,10 @@ so a revoked install is dropped live rather than at its next request.
 #### 2.11.1 What a session revoke stops
 
 `DELETE /devices/{id}` and `DELETE /devices/me` put the install's `device_id`
-on a per-account denylist. A key-slot revoke (§5.6.3) does not touch this
-denylist, and this does not touch key slots: they are two separate operations
-on the same install.
+on a per-account denylist. They do not touch key slots. A key-slot revoke
+(§5.6.3) puts an install on this denylist only when the slot records which
+session claimed it and that session is not the caller's own; otherwise the
+two are separate operations on the same install.
 
 The denylist is consulted in both directions, and this is the part a third
 implementation has to get right.
@@ -654,15 +698,17 @@ An owner who wants a device out permanently has to rotate what it holds
 (§2.10), which is what actually invalidates its proof, rather than relying on
 the revoke alone.
 
-⚠ **A revoke does not stop push.** Neither call removes the install's rows in
-`device_tokens` (§3.5), so wakes carrying `env`, the sealed envelope of a new
-message, keep going to it until it deletes its own registration or APNs reports
-the token dead (§8.6). Combined with the paragraph in §5.6.3 about the install
-keeping what it already decrypted, this means a revoke stops the account's API
-and socket surface, not delivery to a device that is still holding keys. An
-operator or a client that needs delivery stopped has to call
-`DELETE /users/me/push-token` from that install, which a disconnected install
-has no reason to do.
+⚠ **A revoke stops push only for rows carrying the install's id.** Since
+island 2026.10.01.01 both calls delete the account's rows in `device_tokens`
+(§3.5) registered under the revoked `device_id`, and so does a key-slot revoke
+that ends the session which claimed the slot (§5.6.3). Before that they removed
+nothing, and wakes carrying `env`, the sealed envelope of a new message, kept
+going to a disconnected install for good. A row registered WITHOUT a
+`device_id` (a client older than device ids) is still left in place until the
+install deletes its own registration or APNs reports the token dead (§8.6).
+Combined with the paragraph in §5.6.3 about the install keeping what it
+already decrypted, a revoke stops the account's API, socket and push surface,
+not what a device that still holds keys already has.
 
 ⚠ A revoke can only ever be as good as the id it names. A linked session must
 keep presenting the `device_id` it was issued: an install that re-mints under
@@ -1475,7 +1521,8 @@ viewpoint (so the response includes the owner-only echo fields).
 ```json
 { "token": "<APNs device token | UnifiedPush endpoint URL>",
   "platform": "ios" | "ios-voip" | "android-up",
-  "device_id": "<stable per-install id>"   // optional
+  "device_id": "<stable per-install id>",  // optional
+  "accounts_here": [<int>, ...]            // optional, at most 64
 }
 ```
 
@@ -1483,12 +1530,40 @@ Idempotent on `(uin, token)` via Postgres `INSERT ... ON
 CONFLICT DO UPDATE`; bumps `last_seen` and clears any recorded push
 failure on conflict. `204 No Content`.
 
+`accounts_here` (NEW in v1.19, island 2026.10.01.01) lists every account THIS
+install holds on THIS island, by number. It is how an install sheds the row it
+left under an account it has since deleted or signed out of: by then it no
+longer has that account's credentials, so it cannot send the `DELETE` below,
+and a live endpoint never answers 404/410, so nothing else ever removed the
+row and the phone kept waking for an account it did not hold. Absent, the
+request behaves exactly as before. Present, after the upsert, the island
+deletes every row with the same `token` AND the same non-empty `device_id`
+whose `uin` is neither in `accounts_here` nor the caller, and whose
+`last_seen` is more than 1 hour old. Guards:
+
+- it acts only when a row with the same `(uin, token)` and the same
+  `device_id` already existed BEFORE this request, so a first registration
+  never prunes; the next one does. The token and the device id are not secrets
+  from the other islands the device uses, and without this a throwaway account
+  could name a stranger's endpoint and silence that stranger's other accounts
+  in one request;
+- a row registered (`last_seen`) within the last hour is spared, because the
+  list is composed on the device before it travels and a slow or retried
+  request must not delete an account added a moment ago;
+- a row of another install, or one without a `device_id`, is never touched.
+
+Revoking an install's session (`DELETE /devices/{id}`, `DELETE /devices/me`,
+or a slot revoke that ends the session that claimed the slot, §2.11.1) also
+deletes the rows that install registered for the account under its
+`device_id`.
+
 For `platform: "android-up"` the `token` is the whole address: the
 HTTPS endpoint URL the device's UnifiedPush distributor handed out
 (see §8.7). There is no provider key anywhere on the server.
 
 `DELETE /users/me/push-token`: same body shape; removes the
-matching row if present (no error if absent).
+matching row if present (no error if absent). `accounts_here` is
+ignored here.
 
 `GET /users/me/push-health`:
 
@@ -1657,8 +1732,18 @@ decrypting and identifying the sender.
 
 ### 4.7 `POST /contacts/{contact_uin}/block`
 
-Toggles the `blocked` flag on the caller's row pointing at
-`contact_uin`. `404` if not in list. Returns `{ "blocked": <bool> }`.
+Sets or toggles the `blocked` flag on the caller's row pointing at
+`contact_uin`. `404` if not in list. Returns `{ "blocked": <bool> }`,
+the flag as it now stands.
+
+Optional body `{ "blocked": true | false }` (NEW in v1.19, island
+2026.10.01.01) SETS the flag to that value. No body, `{}`, or a body
+without a boolean `blocked` TOGGLES it, as every earlier island did. A
+toggle is only right when the caller knows the current state, and a
+client reading a stale contact list (a `304` on the conditional
+`GET`, or a second device that blocked first) turned "Block" into an
+unblock. A client should send the body and still read the answer: an
+island older than this toggles whatever it is sent.
 
 Blocking is a client-side filter only for messages (same sealed-
 sender constraint). On the server, the `blocked` flag is
@@ -2253,9 +2338,11 @@ What a revoke does:
 What a revoke does **not** do. It means "stop talking to it", not remote
 erasure: the install keeps everything it already decrypted. Copies already
 deposited in the offline queue against that slot (§6.3.1) are still handed out
-to whoever drains with that `dev`. And it does not touch the install's session:
-the token stays valid, and disconnecting a session is the separate call in
-§2.11.
+to whoever drains with that `dev`. And it ends the install's session only when
+the slot records which session claimed it (slots claimed since 2026-08-22) and
+that session is not the caller's own: that session is then ended exactly as
+`DELETE /devices/{id}` ends one (§2.11.1). Otherwise the token stays valid, and
+disconnecting a session is the separate call in §2.11.
 
 Slot 1 is refused with `400`:
 
@@ -5030,6 +5117,9 @@ is what this section used to say for everyone.
 
 - Registered via `POST /users/me/push-token` (Section 3.5).
 - Pruned on `DELETE /users/me/push-token`.
+- Pruned by the same install's `accounts_here` on its next
+  registration (Section 3.5).
+- Pruned when the install's session is revoked (§2.11.1).
 - Pruned automatically on APNs response codes 400
   `BadDeviceToken`, 410 `Unregistered`, and 403
   `BadEnvironmentKeyInToken`.
@@ -6738,7 +6828,7 @@ implementation already does) may go straight to PR.
 
 ### 15.2 Versioning
 
-This document is **v1.18**. The protocol wire major is still v1;
+This document is **v1.19**. The protocol wire major is still v1;
 the `.x` suffix tracks doc revisions. Wire-breaking changes would
 bump the major. Additive endpoints, new optional fields, and new
 envelope types do not require a major bump; they are recorded in
@@ -6781,3 +6871,4 @@ rather than a field (§9.4.7), and a spec version cannot enforce that. Read
 | v1.16   | 2026-09-02 | **Island trust without a certificate authority** (new §11.6). A client trusts an island one of two ways: through the platform trust store as before, or, when the platform refuses the chain, by the SHA-256 of the DER leaf, pinned on the device the way an SSH host key is. The rule in full (§11.6.1): a CA-valid chain is accepted and writes a `ca` record even over a pin, so a Let's Encrypt renewal never warns and an island that moves to a CA needs nothing from its users; an unknown host with a private certificate is accepted on first use and said out loud once; a pinned host whose leaf changed, or a CA host now showing a private certificate, is NOT connected to at all until a person accepts the new fingerprint from a banner. The CA-only list, `api.rcq.app`, the front and everything under `rcq.app`, is never trusted on first use (§11.6.2). The canonical, accepted and display forms of the fingerprint, and why it is the leaf and not the SPKI (§11.6.3); the `host[:port]#fp` fragment every address form takes, which pins BEFORE the first connection and turns a mismatch into a refusal, and the device-scoped `host:port` store (§11.6.4); the four outcomes and what each one shows, and why a browser is left out (§11.6.5); what an island must do, a long-lived leaf with the address in the SAN, and why the CLI alone needs the SAN (§11.6.6); and the residual risk written down rather than claimed away: a first contact on a hostile network pins the attacker, and an impostor island is a hostile island with a hostile island's powers and no more (§11.6.7). No byte on the wire changes and `/server/info` deliberately does not carry the fingerprint. **`links_allowed` and `files_allowed` documented** (§6.4.3, §6.4.2, new §6.4.9): two owner-only booleans have lived on the island since 2026-08-21 and this document had no words for them. They are the first group rules the island CANNOT enforce, since it cannot see inside a sealed envelope, so they are house rules the clients keep on the owner's behalf and never a security boundary. `files_allowed = false` blocks documents, photos and videos and not voice notes, the rule decided 2026-09-02; ⚠ the clients shipped on that date still gate the microphone (Android 0.160, the web) or only the document chip (iOS). Exemption is the owner, admins and any granted cap, both ways. **Corrections.** §15.2 still stamped the document v1.12, and this history stopped there while the title had been stamped v1.13, v1.14 and v1.15 on 2026-08-30 without a row each; the three rows above are backfilled from the diffs, and so is the unstamped 2026-09-01 row. |
 | v1.17   | 2026-09-02 | **§11.6 tightened after review, the same evening.** Five changes to the rule of §11.6.1 and its surroundings, none of them on the wire. (1) A TYPED fingerprint wins over an authority: a chain that does not hash to the value the person entered is `REFUSE(changed)` even when the platform trusts it, where v1.16 let any CA-valid chain overwrite the typed pin silently, so the "careful path" of §11.6.4 promised what the rule did not give; accepting that banner records `ca` (§11.6.5), and §11.6.6 now says a move to a CA is silent for first-use and accepted pins and one banner for typed ones. (2) `caValid` is defined as chain AND name for the dialled host, since a chain validator that ignores the name (Android's) would have let a captive portal's certificate write `ca` over a pin. (3) The rule runs on BOTH outcomes of platform validation on every client, and the text says why: without the `ca` write on success there is no `ca` record, and a known CA island is an unknown island to an attacker's self-signed certificate. (4) A fragment against a record that disagrees is `REFUSE(changed)` with a banner, never a silent write, and a fragment that is not 64 hex is an address error with no connection (§11.6.4). (5) A refusal is not a blocked route: the client does not engage relays or a front, retry, or report censorship on it, and a probe answers reachable / refused / unreachable (§11.6.1, §11.6.5). §11.6.7 corrects an overclaim: an impostor island reads no body of an EXISTING session, but a first contact or a registration made through it rests on safety numbers, as against a compromised backend. **§6.4.9**: a `.rcq` site address joins the set `links_allowed = false` blocks, which the renderers already honoured while the send gates did not. **§15.3**: the 2026-09-01 reserved-number change gets its own row. |
 | v1.18   | 2026-09-19 | **The document caught up with the server, against `rcq-server-ref`.** Nothing here changes the wire; all of it changes what this document says the wire is, and four of the items below would have produced a working-looking client that fails in the field. **`GET /server/info` was missing fourteen things** (§2.13): `closed_island`, `cross_island`, `entry_price_cents`, `entry_url`, `till_url`, `terms_url`, `user_count`, `max_accounts_per_device`, `users_lookup`, `contacts_readonly`, `contact_pending_withdraw`, `guest_accounts_v1`, `reissue_proof_v1`, and `badges`, which is a TOP-LEVEL sibling of `name` and `logo_version` and not a capability at all. Each is documented with its absent-reads-as default, and ⚠ `contact_pending_withdraw` is the one key whose permissive reading is wrong: absent means NO withdraw, and a client that declines instead leaves the requester an answer they keep for 180 days. **`POST /auth/register` was documented as it stood in v1** (§2.2): the request gains `invite`, `desired_uin`, `home_record`, `device_id`, `challenge` and `signature`, the response gains `guest`, and the `invite` field is one box carrying either a server-join invite or a paid ENTRY VOUCHER, with the voucher redeemed whenever it verifies even on an open island. `registration_policy` has a third value, `paid`. The side-effects list promised a starter pack of currency and three random items and a referral row; both were deleted, and what actually happens is two mutual contact edges and nothing recorded. The door refusal codes are now in §12.1. **Guest copies** (new §2.15): `POST /auth/guest/challenge`, `POST /auth/guest`, `POST /auth/guest/settle`, `POST /groups/{id}/guests`, the `rcq-guest-v1` proof bytes, the `guest` flag on the register/refresh/recover replies, and the RESTRICTION SET a guest lives under — written out in full because a client that does not know it draws buttons that always fail, and because two of those restrictions answer an empty list rather than a 403 on purpose. **Guest cards** (new §5.8) are a separate, earlier feature and share only the word: three endpoints, and the island never sees a card, only the sha256 of 32 bytes the client generated. **The closed-island key door** (new §5.7, and a warning added to §5.3): the three card modes `full` / `seal` / `refused`, the `X-RCQ-Guest-Card` header and why it is a header, the `403 island_closed` that happens only under the optional `federation_refuse_strangers`, and — the reason this is not editorial — the `404` that §5.3 told a client to read as "fall back to v=1" means "you have no card for this person" on a closed island, byte for byte identical on purpose so that a refusal is not a directory lookup. It is disambiguated by `capabilities.closed_island` and by nothing else. **The room receive path** (new §6.3.3, §6.3.3.1), which the spec named once as the `group_log` capability and never specified: both schemas, `after`, the per-device cursor that starts at the room's HEAD, the 128 KiB page budget that truncates a page regardless of `limit`, and the reader-mark rule — the mark is earned by an ACK or by a fetch that had nothing to return, never by asking, which the handler's own docstring still gets wrong — plus the rule that legacy per-member rows stop only once EVERY legacy-draining device of an account is a reader. **Corrections.** Presence freshness is 90 s and not 60 (§3.3, §7.3), and the offline debounce is defined as equal to the freshness window rather than as its own constant. §9.5 documented `GET /media/usage`, which does not exist and is swallowed by `GET /media/{media_id}`, so it answers a well-formed `404 "bad media id"` from a real handler rather than a missing-path 404. §3.1 was titled for `GET /users/me/info`, which returns `422` because the path parameter is an integer; the owner path is `GET /users/{own uin}/info`, and `badge` joins the always-present table. §12.2 said rate limits fail soft; sixteen rules now fail CLOSED, including the whole registration path, with per-/24 and per-/64 subnet buckets and an island-wide minting ceiling answering `503 island_busy`. §7.4.7 omitted `call_unreachable` and `call_offline`, so a spec-built client rings into silence; five more server-to-client frames are added (`contact_request_cancelled`, `contact_renamed`, `vault_reset`, `account_moved`, `news_posted` in new §7.4.11). **Four endpoints** shipped undocumented: `POST /residency/redeem` and `DELETE /invites/{invite_id}` (§2.16), `POST /users/lookup` (§4.10), and `/entry/payout-target` in the §14 index. **And the spec pointed four times at `federation-protocol.md`, which exists only in a private repository**; every pointer now says so instead (§0). |
+| v1.19   | 2026-10-05 | **A short number is no longer granted on a record anybody can sign, and two fields that close long-standing client bugs** (island 2026.10.01.01). (1) **Prior tenure** (§2.1, §2.2): a RESERVED `desired_uin` used to be granted on a home-island record naming it under the caller's own signing key, offered as `home_record` or found in the gossip mirror, and such a record proves only who signed it. Now the record is only a pointer to a host in the operator setting `TENURE_TRUSTED_ISLANDS` (default `api.rcq.app,is2.rcq.app`, the island's own names dropped), and that host must confirm over HTTPS, with no redirects and a 4 s budget, both `GET /federation/island-record/{uin}` (verifies, same `sk`, names the number there) and `GET /federation/keys/{uin}` (same `uin` and `signing_key`). Any failure is a fresh number, never an error. The lookup is skipped at a door that will refuse anyway (invite or paid island, empty `invite`), and MUST NOT be skipped because the number is taken locally, since it runs before the door and its timing would then reveal which short numbers are taken (reference server `5166a12`, after that build). The citation of `_owns_uin_elsewhere`, which no longer exists, is gone. (2) **Block** (§4.7): an optional body `{"blocked": bool}` sets the flag; no body still toggles. (3) **Push rows** (§3.5, §8.6, §2.11.1): optional `accounts_here` (at most 64) on `POST /users/me/push-token` lets an install shed the rows of accounts it no longer holds, only from a prior registration with the same token and `device_id`, never a row of another install or one whose `last_seen` is within the last hour; `DELETE` ignores it. Revoking an install's session now deletes its push rows, so "a revoke does not stop push" in §2.11.1 is no longer true for rows that carry a `device_id`. Also corrected: §2.11.1 and §5.6.3 said a key-slot revoke never touches the session; since 2026-08-22 it ends the session that claimed the slot when the slot records one. No wire-breaking changes. |
