@@ -1,4 +1,4 @@
-# RCQ Protocol Specification (v1.20)
+# RCQ Protocol Specification (v1.21)
 
 ## 0. Status & Scope
 
@@ -47,7 +47,7 @@ Out of scope:
   envelopes; readers should consult the Signal protocol docs for
   X3DH, Double Ratchet, and Sender Key internals.
 
-Version: **v1.20**. Last updated: **2026-10-11**. Spec maintainer:
+Version: **v1.21**. Last updated: **2026-10-11**. Spec maintainer:
 the RCQ team (issues / RFCs against `github.com/rcq-messenger/rcq-spec`).
 
 ⚠ **Known gaps.** The endpoint census below was taken on 2026-08-16 against
@@ -2839,7 +2839,7 @@ them does is wake a phone:
 The rule holds on all three deposit paths, keyed on the type the deposit
 DECLARES: `POST /messages/sealed`, `POST /messages/group-sealed`, and
 `POST /messages/group-broadcast`, where the row and the wake would both say
-`gmsg` whatever is inside (`routers/messages.py:606`, `:1185`, `:1413`). On
+`gmsg` whatever is inside (`routers/messages.py:606`, `:1110`, `:1381`). On
 the group paths the kind is still KEPT for every member a message would be
 kept for, including a dormant member with a push endpoint (the keep rule
 below), and only the wake is withheld, so an edit or a delete reaches whoever
@@ -2856,7 +2856,7 @@ What the class decides:
 |                                     | ephemeral (0) | content (1) | critical (2) |
 |-------------------------------------|---------------|-------------|--------------|
 | Queued for an offline recipient, 1:1 | yes          | yes         | yes          |
-| Queued for an offline recipient, group | only if not dormant | only if not dormant, or a wake is going out | yes |
+| Queued for an offline recipient, group | only if not dormant | only if not dormant, or a wake target (§6.2.2) | yes |
 | Push or wake fired                  | no            | yes, except the five kinds above | no |
 | Exempt from the group dormant sweep | no            | no          | yes          |
 
@@ -2878,11 +2878,15 @@ must arrive without ever raising a banner.
 **Dormant sweep.** The 14-day dormant rule on the GROUP queue (§6.3.1) skips
 critical rows: they are kept for every member, dormant or not. The write side
 mirrors it, so a dormant member's ephemeral copy is not queued at all and their
-content copy only when a push is about to wake them for it (waking somebody for
-a row nobody stored is a notification for a message that never arrives). Key
-material is exempt because a member who loses an `skdm` cannot read a single
-later broadcast, and their client cannot tell "no messages" from "cannot
-decrypt". A few hundred bytes per chain is not what fills that table.
+content copy only when they are a wake target for it: a registered push
+endpoint, and the group not muted (waking somebody for a row nobody stored is
+a notification for a message that never arrives). The five never-pushed kinds
+above are resolved against the same targets and then not woken, so a dormant
+member who was kept a message is also kept its `edit`, `delete` or `reaction`,
+and one who was not is kept neither. Key material is exempt because a member
+who loses an `skdm` cannot read a single later broadcast, and their client
+cannot tell "no messages" from "cannot decrypt". A few hundred bytes per chain
+is not what fills that table.
 
 **Sending it.** `POST /messages/sealed` accepts `cls` directly (§6.2.1). A
 sender that knows what it is sending should state the class, so that an opaque
@@ -3175,9 +3179,12 @@ Behaviour:
   the legacy `"call"`), the ONLY wake this deposit can produce is the ringing
   one, and it fires only when the account has no live socket anywhere. A ring
   deposit never raises a message push, whether the account was online or not
-  (§6.2.1.1). Otherwise, if the deposit is content class and any device of the
-  recipient lacks a socket, an APNs or UnifiedPush wake carries the envelope
-  to those devices as `env` (see Section 8).
+  (§6.2.1.1). Otherwise, if the deposit is content class, its `envelope_type`
+  is not one of the five never-pushed kinds (`carbon`, `reaction`, `edit`,
+  `delete`, `homerec`, §6.1.1), and any device of the recipient lacks a
+  socket, an APNs or UnifiedPush wake carries the envelope to those devices as
+  `env` (see Section 8). A never-pushed kind is queued and sent on the socket
+  like any content row and wakes nothing, whether `cls` was sent or derived.
 
 Response:
 
@@ -3324,13 +3331,20 @@ Behaviour:
 - For each entry whose `to_uin` is an actual group member:
   - Queue an `OfflineGroupMessage` row.
   - Attempt WS delivery to that UIN.
-- For offline recipients, when the deposit is content class (§6.1.1): an
-  APNs or UnifiedPush wake carrying their specific ciphertext, unless the
-  group is in the recipient's `push_preferences.muted_group_ids`. Whom the
-  island is willing to wake also decides whom it keeps the row for: a
-  dormant member (§6.3.1) is queued only when a wake is going out to them,
-  so nobody is notified about a message that was never written down.
-  Critical-class rows are queued for every member, dormant or not.
+- For offline recipients, when the deposit is content class (§6.1.1) and
+  its `envelope_type` is not one of the five never-pushed kinds (`carbon`,
+  `reaction`, `edit`, `delete`, `homerec`): an APNs or UnifiedPush wake
+  carrying their specific ciphertext, to every recipient with a registered
+  push endpoint unless the group is in their
+  `push_preferences.muted_group_ids`.
+- Those wake targets also decide whom the island keeps the row for: a
+  dormant member (§6.3.1) is queued only when they are one, so nobody is
+  notified about a message that was never written down. The targets are
+  resolved for every content deposit, the never-pushed kinds included; for
+  those they decide the keep and nothing else. No wake goes out, and an
+  `edit` or a `delete` is kept for exactly the members a message is kept
+  for, so it reaches whoever holds the original. Critical-class rows are
+  queued for every member, dormant or not.
 
 ⚠ **Muted plus dormant is silent loss, not a silent banner.** The two rules
 compose in one direction only. Muting the group removes the member from the
@@ -4436,18 +4450,22 @@ POST /messages/group-broadcast
 ```
 
 `envelope_type` is optional and defaults to `"message"`. It is the DECLARED
-INNER type, and the island reads it for three things only: the storage class
-(§6.1.1), the `owner_only` post gate (§6.4.4) and the group's slowmode, both of
-which fire on `"message"` and let anything else through. It is never stored. The
-queue row and the socket frame are always typed `gmsg`, whatever was declared,
-because that is what tells a receiving client to decode through the chain
-rather than through a sealed-sender opener.
+INNER type, and the island reads it for these things only: the storage class
+(§6.1.1), whether an offline member is woken (§6.1.1), and three gates that fire
+on `"message"` and let anything else through: the `owner_only` post gate
+(§6.4.4), the group's slowmode and the account-age floor (§6.4.2). It is never
+stored. The queue row and the socket frame are always typed `gmsg`, whatever was
+declared, because that is what tells a receiving client to decode through the
+chain rather than through a sealed-sender opener.
 
-Since `gmsg` is content class, an offline member is woken exactly as they are
-on the per-member path: the same wake, the same `muted_group_ids` gate, and the
-same rule tying the wake set to the keep set for a dormant member (§6.2.2,
-§8.5). Unlike the per-member path, everyone gets the identical envelope, so a
-wake here carries the one ciphertext the whole group shares.
+A broadcast declared as content is woken for exactly as on the per-member
+path: the same wake, the same `muted_group_ids` gate, and the same rule tying
+the wake set to the keep set for a dormant member (§6.2.2, §8.5). A broadcast
+declared as one of the five never-pushed kinds (§6.1.1) wakes nobody, although
+its row and frame say `gmsg` like any other, and is still kept for every member
+a message would be kept for. Unlike the per-member path, everyone gets the
+identical envelope, so a wake here carries the one ciphertext the whole group
+shares.
 
 ⚠ This endpoint requires authentication, unlike every other deposit path.
 Sealed sender is impossible here by construction: one ciphertext for the group
@@ -5137,7 +5155,8 @@ the push:
 
 Sealed-sender messages cannot pass through this filter (sender
 is unknown to the server) and always push when the recipient is
-offline. The user mutes them via iOS system settings or by
+offline, except the five content kinds that are never pushed
+(§6.1.1). The user mutes them via iOS system settings or by
 muting the originating thread inside the app.
 
 ### 8.5 Group muting
@@ -6914,3 +6933,4 @@ rather than a field (§9.4.7), and a spec version cannot enforce that. Read
 | v1.18   | 2026-09-19 | **The document caught up with the server, against `rcq-server-ref`.** Nothing here changes the wire; all of it changes what this document says the wire is, and four of the items below would have produced a working-looking client that fails in the field. **`GET /server/info` was missing fourteen things** (§2.13): `closed_island`, `cross_island`, `entry_price_cents`, `entry_url`, `till_url`, `terms_url`, `user_count`, `max_accounts_per_device`, `users_lookup`, `contacts_readonly`, `contact_pending_withdraw`, `guest_accounts_v1`, `reissue_proof_v1`, and `badges`, which is a TOP-LEVEL sibling of `name` and `logo_version` and not a capability at all. Each is documented with its absent-reads-as default, and ⚠ `contact_pending_withdraw` is the one key whose permissive reading is wrong: absent means NO withdraw, and a client that declines instead leaves the requester an answer they keep for 180 days. **`POST /auth/register` was documented as it stood in v1** (§2.2): the request gains `invite`, `desired_uin`, `home_record`, `device_id`, `challenge` and `signature`, the response gains `guest`, and the `invite` field is one box carrying either a server-join invite or a paid ENTRY VOUCHER, with the voucher redeemed whenever it verifies even on an open island. `registration_policy` has a third value, `paid`. The side-effects list promised a starter pack of currency and three random items and a referral row; both were deleted, and what actually happens is two mutual contact edges and nothing recorded. The door refusal codes are now in §12.1. **Guest copies** (new §2.15): `POST /auth/guest/challenge`, `POST /auth/guest`, `POST /auth/guest/settle`, `POST /groups/{id}/guests`, the `rcq-guest-v1` proof bytes, the `guest` flag on the register/refresh/recover replies, and the RESTRICTION SET a guest lives under — written out in full because a client that does not know it draws buttons that always fail, and because two of those restrictions answer an empty list rather than a 403 on purpose. **Guest cards** (new §5.8) are a separate, earlier feature and share only the word: three endpoints, and the island never sees a card, only the sha256 of 32 bytes the client generated. **The closed-island key door** (new §5.7, and a warning added to §5.3): the three card modes `full` / `seal` / `refused`, the `X-RCQ-Guest-Card` header and why it is a header, the `403 island_closed` that happens only under the optional `federation_refuse_strangers`, and — the reason this is not editorial — the `404` that §5.3 told a client to read as "fall back to v=1" means "you have no card for this person" on a closed island, byte for byte identical on purpose so that a refusal is not a directory lookup. It is disambiguated by `capabilities.closed_island` and by nothing else. **The room receive path** (new §6.3.3, §6.3.3.1), which the spec named once as the `group_log` capability and never specified: both schemas, `after`, the per-device cursor that starts at the room's HEAD, the 128 KiB page budget that truncates a page regardless of `limit`, and the reader-mark rule — the mark is earned by an ACK or by a fetch that had nothing to return, never by asking, which the handler's own docstring still gets wrong — plus the rule that legacy per-member rows stop only once EVERY legacy-draining device of an account is a reader. **Corrections.** Presence freshness is 90 s and not 60 (§3.3, §7.3), and the offline debounce is defined as equal to the freshness window rather than as its own constant. §9.5 documented `GET /media/usage`, which does not exist and is swallowed by `GET /media/{media_id}`, so it answers a well-formed `404 "bad media id"` from a real handler rather than a missing-path 404. §3.1 was titled for `GET /users/me/info`, which returns `422` because the path parameter is an integer; the owner path is `GET /users/{own uin}/info`, and `badge` joins the always-present table. §12.2 said rate limits fail soft; sixteen rules now fail CLOSED, including the whole registration path, with per-/24 and per-/64 subnet buckets and an island-wide minting ceiling answering `503 island_busy`. §7.4.7 omitted `call_unreachable` and `call_offline`, so a spec-built client rings into silence; five more server-to-client frames are added (`contact_request_cancelled`, `contact_renamed`, `vault_reset`, `account_moved`, `news_posted` in new §7.4.11). **Four endpoints** shipped undocumented: `POST /residency/redeem` and `DELETE /invites/{invite_id}` (§2.16), `POST /users/lookup` (§4.10), and `/entry/payout-target` in the §14 index. **And the spec pointed four times at `federation-protocol.md`, which exists only in a private repository**; every pointer now says so instead (§0). |
 | v1.19   | 2026-10-05 | **A short number is no longer granted on a record anybody can sign, and two fields that close long-standing client bugs** (island 2026.10.01.01). (1) **Prior tenure** (§2.1, §2.2): a RESERVED `desired_uin` used to be granted on a home-island record naming it under the caller's own signing key, offered as `home_record` or found in the gossip mirror, and such a record proves only who signed it. Now the record is only a pointer to a host in the operator setting `TENURE_TRUSTED_ISLANDS` (default `api.rcq.app,is2.rcq.app`, the island's own names dropped), and that host must confirm over HTTPS, with no redirects and a 4 s budget, both `GET /federation/island-record/{uin}` (verifies, same `sk`, names the number there) and `GET /federation/keys/{uin}` (same `uin` and `signing_key`). Any failure is a fresh number, never an error. The lookup is skipped at a door that will refuse anyway (invite or paid island, empty `invite`), and MUST NOT be skipped because the number is taken locally, since it runs before the door and its timing would then reveal which short numbers are taken (reference server `5166a12`, after that build). The citation of `_owns_uin_elsewhere`, which no longer exists, is gone. (2) **Block** (§4.7): an optional body `{"blocked": bool}` sets the flag; no body still toggles. (3) **Push rows** (§3.5, §8.6, §2.11.1): optional `accounts_here` (at most 64) on `POST /users/me/push-token` lets an install shed the rows of accounts it no longer holds, only from a prior registration with the same token and `device_id`, never a row of another install or one whose `last_seen` is within the last hour; `DELETE` ignores it. Revoking an install's session now deletes its push rows, so "a revoke does not stop push" in §2.11.1 is no longer true for rows that carry a `device_id`. Also corrected: §2.11.1 and §5.6.3 said a key-slot revoke never touches the session; since 2026-08-22 it ends the session that claimed the slot when the slot records one. No wire-breaking changes. |
 | v1.20   | 2026-10-11 | **Reactions, edits, deletes and home records stop waking the phone** (island 2026.10.11.01, §6.1.1, §7.4.10, §8.2). `reaction`, `edit`, `delete` and `homerec` join `carbon` as content kinds that are stored and delivered like any other but never pushed, on `POST /messages/sealed` and on both group paths, where the declared type decides even though a broadcast row and wake say `gmsg`. On the group paths they are still kept for every member a message is kept for, so an edit or a delete reaches whoever holds the original. Also corrects v1.19, which still said `carbon` and `homerec` are pushed: `carbon` has not been since 2026-09-01. `secscreen`, `system`, messages, rings and unknown kinds push as before. No wire change for a sender. |
+| v1.21   | 2026-10-11 | **Corrections: the paragraphs v1.20 missed still said every content deposit wakes** (§6.1.1, §6.2.1, §6.2.2, §6.5, §8.4). The 1:1 waking rule, the group-sealed behaviour list, the class table's group queueing row, the dormant paragraph, the broadcast transport notes and the sealed-sender line in §8.4 now name the five never-pushed kinds (`carbon`, `reaction`, `edit`, `delete`, `homerec`), and say that a dormant group member is kept a row when they are a wake TARGET (a registered push endpoint, the group not muted), not only when a wake actually goes out: the never-pushed kinds are resolved against the same targets and then not woken. §6.5 also listed three uses of a broadcast's declared type and there are five; the wake and the account-age floor were missing. Island 2026.10.11.02 skips a database read for these kinds and changes nothing a client can see. No wire change. |
